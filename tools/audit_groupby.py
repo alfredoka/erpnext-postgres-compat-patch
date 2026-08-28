@@ -1,4 +1,4 @@
-import ast, re, pathlib
+import ast, re, pathlib, sys
 AGG={"Sum","Max","Min","Count","Avg","GroupConcat","Coalesce","IfNull","ConstantColumn",
      "Case","Cast","Abs","Round","Extract","Concat","Locate","Sqrt","Floor","Ceil","Date","Timestamp"}
 ATTR=re.compile(r'^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$')
@@ -106,11 +106,14 @@ def raw_sql(path,src,res2):
         if bad: res2.append((path,ln,bad,grp.strip()))
 
 res=[];res2=[]
-files=[p for p in pathlib.Path('/tmp/erpnext/erpnext').rglob('*.py') if not p.name.startswith('test_')]
+if len(sys.argv) < 2:
+    sys.exit("usage: audit_groupby.py <erpnext-app-dir>")
+ROOT = pathlib.Path(sys.argv[1])
+files=[p for p in ROOT.rglob('*.py') if not p.name.startswith('test_')]
 for p in files:
     try: src=p.read_text(); tree=ast.parse(src)
     except Exception: continue
-    rel=str(p).replace('/tmp/erpnext/','')
+    rel=str(p.relative_to(ROOT))
     analyze_file(rel,src,tree,res); raw_sql(rel,src,res2)
 
 print(f"archivos: {len(files)}")
