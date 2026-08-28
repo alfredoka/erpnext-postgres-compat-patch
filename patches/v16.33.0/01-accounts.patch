@@ -1,0 +1,898 @@
+diff --git a/erpnext/accounts/doctype/bank_clearance/bank_clearance.py b/erpnext/accounts/doctype/bank_clearance/bank_clearance.py
+index 112fdd0..e252bb5 100644
+--- a/erpnext/accounts/doctype/bank_clearance/bank_clearance.py
++++ b/erpnext/accounts/doctype/bank_clearance/bank_clearance.py
+@@ -7,7 +7,7 @@ from frappe import _, msgprint
+ from frappe.model.document import Document
+ from frappe.query_builder import Case
+ from frappe.query_builder.custom import ConstantColumn
+-from frappe.query_builder.functions import Coalesce, Sum
++from frappe.query_builder.functions import Coalesce, Max, Sum
+ from frappe.utils import cint, flt, fmt_money, getdate
+ from pypika import Order
+ 
+@@ -195,14 +195,17 @@ def get_payment_entries_for_bank_clearance(
+ 		.select(
+ 			ConstantColumn("Journal Entry").as_("payment_document"),
+ 			journal_entry.name.as_("payment_entry"),
+-			journal_entry.cheque_no.as_("cheque_number"),
+-			journal_entry.cheque_date,
++			# non-grouped columns are constant per grouped JE name / account (against_account is
++			# arbitrary per group on MySQL) -> Max() keeps the GROUP BY valid on postgres with the
++			# same value MySQL picked.
++			Max(journal_entry.cheque_no).as_("cheque_number"),
++			Max(journal_entry.cheque_date).as_("cheque_date"),
+ 			Sum(journal_entry_account.debit_in_account_currency).as_("debit"),
+ 			Sum(journal_entry_account.credit_in_account_currency).as_("credit"),
+-			journal_entry.posting_date,
+-			journal_entry_account.against_account,
+-			journal_entry.clearance_date,
+-			journal_entry_account.account_currency,
++			Max(journal_entry.posting_date).as_("posting_date"),
++			Max(journal_entry_account.against_account).as_("against_account"),
++			Max(journal_entry.clearance_date).as_("clearance_date"),
++			Max(journal_entry_account.account_currency).as_("account_currency"),
+ 		)
+ 		.where(
+ 			(journal_entry_account.account == account)
+@@ -215,12 +218,13 @@ def get_payment_entries_for_bank_clearance(
+ 
+ 	if not include_reconciled_entries:
+ 		journal_entry_query = journal_entry_query.where(
+-			(journal_entry.clearance_date.isnull()) | (journal_entry.clearance_date == "0000-00-00")
++			(journal_entry.clearance_date.isnull())
++			| (journal_entry.clearance_date == ("0000-00-00" if frappe.db.db_type != "postgres" else None))
+ 		)
+ 
+ 	journal_entries = (
+ 		journal_entry_query.groupby(journal_entry_account.account, journal_entry.name)
+-		.orderby(journal_entry.posting_date)
++		.orderby(Max(journal_entry.posting_date))
+ 		.orderby(journal_entry.name, order=Order.desc)
+ 	).run(as_dict=True)
+ 
+@@ -290,7 +294,8 @@ def get_payment_entries_for_bank_clearance(
+ 
+ 	if not include_reconciled_entries:
+ 		payment_entry_query = payment_entry_query.where(
+-			(pe.clearance_date.isnull()) | (pe.clearance_date == "0000-00-00")
++			(pe.clearance_date.isnull())
++			| (pe.clearance_date == ("0000-00-00" if frappe.db.db_type != "postgres" else None))
+ 		)
+ 
+ 	payment_entries = (payment_entry_query.orderby(pe.posting_date).orderby(pe.name, order=Order.desc)).run(
+@@ -327,7 +332,8 @@ def get_payment_entries_for_bank_clearance(
+ 
+ 	if not include_reconciled_entries:
+ 		paid_purchase_invoices_query = paid_purchase_invoices_query.where(
+-			(pi.clearance_date.isnull()) | (pi.clearance_date == "0000-00-00")
++			(pi.clearance_date.isnull())
++			| (pi.clearance_date == ("0000-00-00" if frappe.db.db_type != "postgres" else None))
+ 		)
+ 
+ 	paid_purchase_invoices = (
+@@ -367,7 +373,8 @@ def get_payment_entries_for_bank_clearance(
+ 
+ 		if not include_reconciled_entries:
+ 			pos_sales_invoices_query = pos_sales_invoices_query.where(
+-				(si_payment.clearance_date.isnull()) | (si_payment.clearance_date == "0000-00-00")
++				(si_payment.clearance_date.isnull())
++				| (si_payment.clearance_date == ("0000-00-00" if frappe.db.db_type != "postgres" else None))
+ 			)
+ 
+ 		pos_sales_invoices = (
+diff --git a/erpnext/accounts/doctype/bank_reconciliation_tool/bank_reconciliation_tool.py b/erpnext/accounts/doctype/bank_reconciliation_tool/bank_reconciliation_tool.py
+index 01191a7..967a8fc 100644
+--- a/erpnext/accounts/doctype/bank_reconciliation_tool/bank_reconciliation_tool.py
++++ b/erpnext/accounts/doctype/bank_reconciliation_tool/bank_reconciliation_tool.py
+@@ -9,7 +9,7 @@ import frappe
+ from frappe import _
+ from frappe.model.document import Document
+ from frappe.query_builder.custom import ConstantColumn
+-from frappe.query_builder.functions import Sum
++from frappe.query_builder.functions import Max, Sum
+ from frappe.utils import cint, create_batch, flt
+ 
+ from erpnext import get_default_cost_center
+@@ -1414,12 +1414,14 @@ def get_je_matching_query(
+ 			Sum(getattr(jea, amount_field)).as_("paid_amount"),
+ 			ConstantColumn("Journal Entry").as_("doctype"),
+ 			je.name,
+-			je.cheque_no.as_("reference_no"),
+-			je.cheque_date.as_("reference_date"),
+-			je.pay_to_recd_from.as_("party"),
+-			jea.party_type,
+-			je.posting_date,
+-			jea.account_currency.as_("currency"),
++			# non-grouped columns are constant per grouped JE name (party_type/currency come from the
++			# single bank-account line) -> Max() keeps the GROUP BY valid on postgres with the same value
++			Max(je.cheque_no).as_("reference_no"),
++			Max(je.cheque_date).as_("reference_date"),
++			Max(je.pay_to_recd_from).as_("party"),
++			Max(jea.party_type).as_("party_type"),
++			Max(je.posting_date).as_("posting_date"),
++			Max(jea.account_currency).as_("currency"),
+ 		)
+ 		.where(je.docstatus == 1)
+ 		.where(je.voucher_type != "Opening Entry")
+@@ -1427,7 +1429,7 @@ def get_je_matching_query(
+ 		.where(jea.account == common_filters.bank_account)
+ 		.where(filter_by_date)
+ 		.groupby(je.name)
+-		.orderby(je.cheque_date if cint(filter_by_reference_date) else je.posting_date)
++		.orderby(Max(je.cheque_date) if cint(filter_by_reference_date) else Max(je.posting_date))
+ 	)
+ 
+ 	if frappe.flags.auto_reconcile_vouchers is True:
+diff --git a/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py b/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py
+index 3d45d04..79be07e 100644
+--- a/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py
++++ b/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py
+@@ -1,13 +1,14 @@
+ # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and contributors
+ # For license information, please see license.txt
+ 
++from datetime import date
+ 
+ import frappe
+ from frappe import _, qb
+ from frappe.model.document import Document
+ from frappe.model.meta import get_field_precision
+ from frappe.query_builder import Criterion, Order
+-from frappe.query_builder.functions import NullIf, Sum
++from frappe.query_builder.functions import Max, NullIf, Sum
+ from frappe.utils import flt, get_link_to_form, nowdate
+ 
+ import erpnext
+@@ -212,12 +213,18 @@ class ExchangeRateRevaluation(Document):
+ 				accounts = [x[0] for x in res]
+ 
+ 			if accounts:
+-				having_clause = (qb.Field("balance") != qb.Field("balance_in_account_currency")) & (
+-					(qb.Field("balance_in_account_currency") != 0) | (qb.Field("balance") != 0)
+-				)
+-
+ 				gle = qb.DocType("GL Entry")
+ 
++				# balance expressions reused in both SELECT and HAVING; postgres can't reference a
++				# SELECT alias inside HAVING, so the aggregate expression must be repeated there.
++				balance = Sum(gle.debit) - Sum(gle.credit)
++				balance_in_account_currency = Sum(gle.debit_in_account_currency) - Sum(
++					gle.credit_in_account_currency
++				)
++				having_clause = (balance != balance_in_account_currency) & (
++					(balance_in_account_currency != 0) | (balance != 0)
++				)
++
+ 				# conditions
+ 				conditions = []
+ 				conditions.append(gle.account.isin(accounts))
+@@ -233,17 +240,15 @@ class ExchangeRateRevaluation(Document):
+ 					qb.from_(gle)
+ 					.select(
+ 						gle.account,
+-						gle.party_type,
+-						gle.party,
+-						gle.account_currency,
+-						(Sum(gle.debit_in_account_currency) - Sum(gle.credit_in_account_currency)).as_(
+-							"balance_in_account_currency"
+-						),
+-						(Sum(gle.debit) - Sum(gle.credit)).as_("balance"),
+-						(Sum(gle.debit) - Sum(gle.credit) == 0)
+-						^ (Sum(gle.debit_in_account_currency) - Sum(gle.credit_in_account_currency) == 0).as_(
+-							"zero_balance"
+-						),
++						# grouped by NullIf(party_type/party, ""); the bare columns + account_currency are
++						# constant per group -> Max() keeps the GROUP BY valid on postgres with the same value.
++						Max(gle.party_type).as_("party_type"),
++						Max(gle.party).as_("party"),
++						Max(gle.account_currency).as_("account_currency"),
++						balance_in_account_currency.as_("balance_in_account_currency"),
++						balance.as_("balance"),
++						# zero_balance is recomputed in Python below (after rounding), so the SQL value is
++						# unused -- dropped (it used MySQL's XOR operator, which postgres lacks).
+ 					)
+ 					.where(Criterion.all(conditions))
+ 					.groupby(gle.account, NullIf(gle.party_type, ""), NullIf(gle.party, ""))
+diff --git a/erpnext/accounts/doctype/gl_entry/gl_entry.py b/erpnext/accounts/doctype/gl_entry/gl_entry.py
+index 452164c..71fd935 100644
+--- a/erpnext/accounts/doctype/gl_entry/gl_entry.py
++++ b/erpnext/accounts/doctype/gl_entry/gl_entry.py
+@@ -7,6 +7,7 @@ from frappe import _
+ from frappe.model.document import Document
+ from frappe.model.meta import get_field_precision
+ from frappe.model.naming import set_name_from_naming_options
++from frappe.query_builder.functions import Sum
+ from frappe.utils import create_batch, flt, fmt_money, now
+ 
+ import erpnext
+@@ -464,6 +465,25 @@ def on_doctype_update():
+ 	frappe.db.add_index("GL Entry", ["posting_date", "company"])
+ 	frappe.db.add_index("GL Entry", ["party_type", "party"])
+ 
++	if frappe.db.db_type == "postgres":
++		# Postgres-only partial/covering indexes for the financial reports (General Ledger, Trial
++		# Balance, Balance Sheet, P&L), which always filter `is_cancelled = 0` and scope by company.
++		# `where`/`include` are no-ops on MariaDB and its optimizer ignores these anyway, so they are
++		# added only on postgres to avoid dead write overhead on this insert-hot table.
++		frappe.db.add_index(
++			"GL Entry",
++			["company", "posting_date", "account"],
++			index_name="gle_active_detail",
++			where="is_cancelled = 0",
++		)
++		frappe.db.add_index(
++			"GL Entry",
++			["company", "account", "posting_date"],
++			index_name="gle_active_cover",
++			where="is_cancelled = 0",
++			include=["debit", "credit"],
++		)
++
+ 
+ def rename_gle_sle_docs():
+ 	for doctype in ["GL Entry", "Stock Ledger Entry"]:
+diff --git a/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py b/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py
+index be6f8dd..6e67d16 100644
+--- a/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py
++++ b/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py
+@@ -568,7 +568,8 @@ def process_individual_date(docname: str, row_name, date, report_type, parentfie
+ 		Sum(gle.credit).as_("credit"),
+ 		Sum(gle.debit_in_account_currency).as_("debit_in_account_currency"),
+ 		Sum(gle.credit_in_account_currency).as_("credit_in_account_currency"),
+-		gle.account_currency,
++		# account_currency is constant per grouped account -> Max() keeps the GROUP BY postgres-valid
++		Max(gle.account_currency).as_("account_currency"),
+ 	).where(
+ 		(gle.company.eq(company))
+ 		& (gle.is_cancelled.eq(0))
+diff --git a/erpnext/accounts/doctype/unreconcile_payment/unreconcile_payment.py b/erpnext/accounts/doctype/unreconcile_payment/unreconcile_payment.py
+index 02cad39..86261e6 100644
+--- a/erpnext/accounts/doctype/unreconcile_payment/unreconcile_payment.py
++++ b/erpnext/accounts/doctype/unreconcile_payment/unreconcile_payment.py
+@@ -7,7 +7,7 @@ import frappe
+ from frappe import _, qb
+ from frappe.model.document import Document
+ from frappe.query_builder import Criterion
+-from frappe.query_builder.functions import Abs, Sum
++from frappe.query_builder.functions import Abs, Max, Sum
+ from frappe.utils.data import comma_and
+ 
+ from erpnext.accounts.utils import (
+@@ -120,18 +120,20 @@ def get_linked_payments_for_doc(
+ 			res = (
+ 				qb.from_(ple)
+ 				.select(
+-					ple.account,
+-					ple.party_type,
+-					ple.party,
+-					ple.company,
+-					ple.voucher_type.as_("reference_doctype"),
++					Max(ple.account).as_("account"),
++					Max(ple.party_type).as_("party_type"),
++					Max(ple.party).as_("party"),
++					Max(ple.company).as_("company"),
++					Max(ple.voucher_type).as_("reference_doctype"),
+ 					ple.voucher_no.as_("reference_name"),
+ 					Abs(Sum(ple.amount_in_account_currency)).as_("allocated_amount"),
+-					ple.account_currency,
++					Max(ple.account_currency).as_("account_currency"),
+ 				)
+ 				.where(Criterion.all(criteria))
+ 				.groupby(ple.voucher_no, ple.against_voucher_no)
+-				.having(qb.Field("allocated_amount") > 0)
++				.having(Abs(Sum(ple.amount_in_account_currency)) > 0)
++				# deterministic order across backends (postgres GROUP BY does not imply ordering)
++				.orderby(ple.voucher_no)
+ 				.run(as_dict=True)
+ 			)
+ 			return res
+@@ -146,17 +148,19 @@ def get_linked_payments_for_doc(
+ 			query = (
+ 				qb.from_(ple)
+ 				.select(
+-					ple.company,
+-					ple.account,
+-					ple.party_type,
+-					ple.party,
+-					ple.against_voucher_type.as_("reference_doctype"),
++					Max(ple.company).as_("company"),
++					Max(ple.account).as_("account"),
++					Max(ple.party_type).as_("party_type"),
++					Max(ple.party).as_("party"),
++					Max(ple.against_voucher_type).as_("reference_doctype"),
+ 					ple.against_voucher_no.as_("reference_name"),
+ 					Abs(Sum(ple.amount_in_account_currency)).as_("allocated_amount"),
+-					ple.account_currency,
++					Max(ple.account_currency).as_("account_currency"),
+ 				)
+ 				.where(Criterion.all(criteria))
+ 				.groupby(ple.against_voucher_no)
++				# deterministic order across backends (postgres GROUP BY does not imply ordering)
++				.orderby(ple.against_voucher_no)
+ 			)
+ 
+ 			res = query.run(as_dict=True)
+@@ -180,23 +184,26 @@ def get_linked_advances(company, docname):
+ 	return (
+ 		qb.from_(adv)
+ 		.select(
+-			adv.company,
+-			adv.against_voucher_type.as_("reference_doctype"),
++			# non-grouped columns are constant per against_voucher_no -> Max() is unchanged and postgres-valid
++			Max(adv.company).as_("company"),
++			Max(adv.against_voucher_type).as_("reference_doctype"),
+ 			adv.against_voucher_no.as_("reference_name"),
+ 			Abs(Sum(adv.amount)).as_("allocated_amount"),
+-			adv.currency,
++			Max(adv.currency).as_("currency"),
+ 		)
+ 		.where(Criterion.all(criteria))
+-		.having(qb.Field("allocated_amount") > 0)
++		.having(Abs(Sum(adv.amount)) > 0)
+ 		.groupby(adv.against_voucher_no)
++		# deterministic order across backends (postgres GROUP BY does not imply ordering)
++		.orderby(adv.against_voucher_no)
+ 		.run(as_dict=True)
+ 	)
+ 
+ 
+ @frappe.whitelist()
+-def create_unreconcile_doc_for_selection(selections=None):
++def create_unreconcile_doc_for_selection(selections: str | list | None = None):
+ 	if selections:
+-		selections = json.loads(selections)
++		selections = frappe.parse_json(selections)
+ 		# assuming each row is a unique voucher
+ 		for row in selections:
+ 			unrecon = frappe.new_doc("Unreconcile Payment")
+diff --git a/erpnext/accounts/report/accounts_receivable/accounts_receivable.py b/erpnext/accounts/report/accounts_receivable/accounts_receivable.py
+index 8f6ee26..ed6362b 100644
+--- a/erpnext/accounts/report/accounts_receivable/accounts_receivable.py
++++ b/erpnext/accounts/report/accounts_receivable/accounts_receivable.py
+@@ -686,11 +686,14 @@ class ReceivablePayableReport:
+ 				(pe.posting_date).as_("future_date"),
+ 				(pe_ref.allocated_amount).as_("future_amount"),
+ 				(pe.reference_no).as_("future_ref"),
+-				ifelse(
++				# CASE is portable; MySQL's IF() does not exist on postgres
++				query_builder.Case()
++				.when(
+ 					pe.payment_type == "Receive",
+ 					pe.source_exchange_rate * pe_ref.allocated_amount,
+-					pe.target_exchange_rate * pe_ref.allocated_amount,
+-				).as_("future_amount_in_base_currency"),
++				)
++				.else_(pe.target_exchange_rate * pe_ref.allocated_amount)
++				.as_("future_amount_in_base_currency"),
+ 			)
+ 			.where(
+ 				(pe.docstatus < 2)
+@@ -724,30 +727,33 @@ class ReceivablePayableReport:
+ 
+ 		if self.filters.get("party"):
+ 			if self.account_type == "Payable":
+-				query = query.select(
+-					Sum(jea.debit_in_account_currency - jea.credit_in_account_currency).as_("future_amount")
+-				)
+-				query = query.select(Sum(jea.debit - jea.credit).as_("future_amount_in_base_currency"))
++				future_amount = Sum(jea.debit_in_account_currency - jea.credit_in_account_currency)
++				future_amount_in_base_currency = Sum(jea.debit - jea.credit)
+ 			else:
+-				query = query.select(
+-					Sum(jea.credit_in_account_currency - jea.debit_in_account_currency).as_("future_amount")
+-				)
+-				query = query.select(Sum(jea.credit - jea.debit).as_("future_amount_in_base_currency"))
++				future_amount = Sum(jea.credit_in_account_currency - jea.debit_in_account_currency)
++				future_amount_in_base_currency = Sum(jea.credit - jea.debit)
+ 		else:
+-			query = query.select(
+-				Sum(jea.debit if self.account_type == "Payable" else jea.credit).as_(
+-					"future_amount_in_base_currency"
+-				)
+-			)
+-			query = query.select(
+-				Sum(
+-					jea.debit_in_account_currency
+-					if self.account_type == "Payable"
+-					else jea.credit_in_account_currency
+-				).as_("future_amount")
++			future_amount_in_base_currency = Sum(jea.debit if self.account_type == "Payable" else jea.credit)
++			future_amount = Sum(
++				jea.debit_in_account_currency
++				if self.account_type == "Payable"
++				else jea.credit_in_account_currency
+ 			)
+ 
+-		query = query.having(qb.Field("future_amount") > 0)
++		query = query.select(
++			future_amount.as_("future_amount"),
++			future_amount_in_base_currency.as_("future_amount_in_base_currency"),
++		)
++		# One row per (future-payment JE, invoice, party): group by the JE name (primary key, so the
++		# JE-level posting_date/cheque_no are deterministic) plus the per-reference dimensions, summing
++		# amounts across JE Account rows that hit the same invoice. Without this GROUP BY the implicit
++		# single-group aggregate collapsed every future JE payment into one row keyed by an arbitrary
++		# invoice, mis-allocating the whole sum.
++		query = query.groupby(
++			je.name, jea.reference_name, jea.party, jea.party_type, je.posting_date, je.cheque_no
++		)
++		# use the aggregate expression in HAVING; postgres can't reference a SELECT alias there
++		query = query.having(future_amount > 0)
+ 		return query.run(as_dict=True)
+ 
+ 	def allocate_future_payments(self, row):
+diff --git a/erpnext/accounts/report/budget_variance_report/budget_variance_report.py b/erpnext/accounts/report/budget_variance_report/budget_variance_report.py
+index ba6c936..017f7a8 100644
+--- a/erpnext/accounts/report/budget_variance_report/budget_variance_report.py
++++ b/erpnext/accounts/report/budget_variance_report/budget_variance_report.py
+@@ -3,7 +3,7 @@
+ 
+ import frappe
+ from frappe import _
+-from frappe.query_builder import CustomFunction
++from frappe.query_builder.custom import MonthName
+ from frappe.utils import add_months, flt, formatdate
+ 
+ from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import get_dimensions
+@@ -119,8 +119,6 @@ def build_budget_map(budget_records, filters):
+ 
+ def get_actual_transactions(dimension_name, filters):
+ 	budget_against = frappe.scrub(filters.get("budget_against"))
+-	monthname = CustomFunction("MONTHNAME", ["date"])
+-
+ 	gle = frappe.qb.DocType("GL Entry")
+ 	budget = frappe.qb.DocType("Budget")
+ 
+@@ -132,7 +130,7 @@ def get_actual_transactions(dimension_name, filters):
+ 			gle.debit,
+ 			gle.credit,
+ 			gle.fiscal_year,
+-			monthname(gle.posting_date).as_("month_name"),
++			MonthName(gle.posting_date).as_("month_name"),
+ 			budget[budget_against].as_("budget_against"),
+ 		)
+ 		.where(
+@@ -143,7 +141,10 @@ def get_actual_transactions(dimension_name, filters):
+ 			& (gle.is_cancelled == 0)
+ 			& (budget[budget_against] == dimension_name)
+ 		)
+-		.groupby(gle.name)
++		# budget[budget_against] is selected from the Budget table, which is not functionally
++		# dependent on the grouped GL Entry PK, so postgres requires it in the GROUP BY. The WHERE
++		# pins it to dimension_name (a constant), so grouping by it does not change the result.
++		.groupby(gle.name, budget[budget_against])
+ 		.orderby(gle.fiscal_year)
+ 	)
+ 
+diff --git a/erpnext/accounts/report/deferred_revenue_and_expense/deferred_revenue_and_expense.py b/erpnext/accounts/report/deferred_revenue_and_expense/deferred_revenue_and_expense.py
+index 22fabea..1b7ea50 100644
+--- a/erpnext/accounts/report/deferred_revenue_and_expense/deferred_revenue_and_expense.py
++++ b/erpnext/accounts/report/deferred_revenue_and_expense/deferred_revenue_and_expense.py
+@@ -3,7 +3,8 @@
+ 
+ import frappe
+ from frappe import _, qb
+-from frappe.query_builder import Column, functions
++from frappe.query_builder import functions
++from frappe.query_builder.custom import ConstantColumn
+ from frappe.utils import add_days, date_diff, flt, get_first_day, get_last_day, getdate, rounded
+ 
+ from erpnext.accounts.report.financial_statements import get_period_list
+@@ -300,8 +301,10 @@ class Deferred_Revenue_and_Expense_Report:
+ 		Get all sales and purchase invoices which has deferred revenue/expense items
+ 		"""
+ 		gle = qb.DocType("GL Entry")
+-		# column doesn't have an alias option
+-		posted = Column("posted")
++		# a literal marker: real GL rows are "posted" (dummy/simulated future entries use "not").
++		# ConstantColumn renders a single-quoted string literal, valid on both backends -- a plain
++		# Column rendered as "posted", which MySQL reads as the string but postgres as an identifier.
++		posted = ConstantColumn("posted").as_("posted")
+ 
+ 		if self.filters.type == "Revenue":
+ 			inv = qb.DocType("Sales Invoice")
+@@ -327,13 +330,15 @@ class Deferred_Revenue_and_Expense_Report:
+ 			)
+ 			.select(
+ 				inv.name.as_("doc"),
+-				inv.posting_date,
++				# non-grouped columns are constant per grouped invoice / invoice item -> Max() keeps the
++				# GROUP BY valid on postgres while returning the same value MySQL picked.
++				functions.Max(inv.posting_date).as_("posting_date"),
+ 				inv_item.name.as_("item"),
+-				inv_item.item_name,
+-				inv_item.service_start_date,
+-				inv_item.service_end_date,
+-				inv_item.base_net_amount,
+-				deferred_account_field,
++				functions.Max(inv_item.item_name).as_("item_name"),
++				functions.Max(inv_item.service_start_date).as_("service_start_date"),
++				functions.Max(inv_item.service_end_date).as_("service_end_date"),
++				functions.Max(inv_item.base_net_amount).as_("base_net_amount"),
++				functions.Max(deferred_account_field).as_(deferred_account_field.name),
+ 				gle.posting_date.as_("gle_posting_date"),
+ 				functions.Sum(gle.debit).as_("debit"),
+ 				functions.Sum(gle.credit).as_("credit"),
+diff --git a/erpnext/accounts/report/inactive_sales_items/inactive_sales_items.py b/erpnext/accounts/report/inactive_sales_items/inactive_sales_items.py
+index 6f90cb1..bf31018 100644
+--- a/erpnext/accounts/report/inactive_sales_items/inactive_sales_items.py
++++ b/erpnext/accounts/report/inactive_sales_items/inactive_sales_items.py
+@@ -6,6 +6,7 @@ import frappe
+ from frappe import _
+ from frappe.query_builder import CustomFunction
+ from frappe.utils import cint
++from pypika.terms import LiteralValue
+ 
+ 
+ def execute(filters=None):
+@@ -102,11 +103,18 @@ def get_sales_details(filters):
+ 	child_doctype = "Sales Order Item" if filters["based_on"] == "Sales Order" else "Sales Invoice Item"
+ 	child = frappe.qb.DocType(child_doctype)
+ 
+-	date_diff = CustomFunction("DATEDIFF", ["d1", "d2"])
+-	current_date = CustomFunction("CURRENT_DATE", [])
+-
+ 	date_col = parent.transaction_date if filters["based_on"] == "Sales Order" else parent.posting_date
+-	days_since_last_order = date_diff(current_date(), date_col)
++
++	# frappe 17 ships a postgres-aware DateDiff/CurDate pair; frappe 16 does not, and there they
++	# resolve to pypika's, which render DATEDIFF(...) and CURRENT_DATE() -- both invalid on
++	# postgres, and pypika's DateDiff takes three arguments besides. Subtracting two dates on
++	# postgres yields the same integer number of days DATEDIFF returns on MariaDB.
++	if frappe.db.db_type == "postgres":
++		days_since_last_order = LiteralValue("CURRENT_DATE") - date_col
++	else:
++		date_diff = CustomFunction("DATEDIFF", ["d1", "d2"])
++		current_date = CustomFunction("CURRENT_DATE", [])
++		days_since_last_order = date_diff(current_date(), date_col)
+ 
+ 	sales_data = (
+ 		frappe.qb.from_(parent)
+diff --git a/erpnext/accounts/report/purchase_register/purchase_register.py b/erpnext/accounts/report/purchase_register/purchase_register.py
+index a54e4df..df1c1ab 100644
+--- a/erpnext/accounts/report/purchase_register/purchase_register.py
++++ b/erpnext/accounts/report/purchase_register/purchase_register.py
+@@ -5,7 +5,9 @@
+ import frappe
+ from frappe import _, msgprint
+ from frappe.model.meta import get_field_precision
++from frappe.query_builder import Case
+ from frappe.query_builder.custom import ConstantColumn
++from frappe.query_builder.functions import Sum
+ from frappe.utils import flt, getdate
+ from pypika.terms import Bracket, LiteralValue, Order
+ 
+@@ -323,14 +325,22 @@ def get_account_columns(invoice_list, include_payments):
+ 	unrealized_profit_loss_account_columns = []
+ 
+ 	if invoice_list:
+-		expense_accounts = frappe.db.sql_list(
+-			"""select distinct expense_account
+-			from `tabPurchase Invoice Item` where docstatus = 1
+-			and (expense_account is not null and expense_account != '')
+-			and parenttype='Purchase Invoice'
+-			and parent in (%s) order by expense_account"""
+-			% ", ".join(["%s"] * len(invoice_list)),
+-			tuple([inv.name for inv in invoice_list]),
++		# frappe drops ORDER BY for distinct queries on postgres (db_query), so sort in python with
++		# casefold to keep the generated account-column order deterministic and identical on both
++		# backends, matching MariaDB's case-insensitive collation (the original ORDER BY).
++		expense_accounts = sorted(
++			frappe.get_all(
++				"Purchase Invoice Item",
++				filters={
++					"docstatus": 1,
++					"expense_account": ["is", "set"],
++					"parenttype": "Purchase Invoice",
++					"parent": ["in", [inv.name for inv in invoice_list]],
++				},
++				pluck="expense_account",
++				distinct=True,
++			),
++			key=str.casefold,
+ 		)
+ 
+ 		purchase_taxes_query = get_taxes_query(invoice_list, "Purchase Taxes and Charges", "Purchase Invoice")
+diff --git a/erpnext/accounts/report/sales_register/sales_register.py b/erpnext/accounts/report/sales_register/sales_register.py
+index d789bcd..01691d0 100644
+--- a/erpnext/accounts/report/sales_register/sales_register.py
++++ b/erpnext/accounts/report/sales_register/sales_register.py
+@@ -369,12 +369,18 @@ def get_account_columns(invoice_list, include_payments):
+ 	unrealized_profit_loss_account_columns = []
+ 
+ 	if invoice_list:
+-		income_accounts = frappe.db.sql_list(
+-			"""select distinct income_account
+-			from `tabSales Invoice Item` where docstatus = 1 and parent in (%s)
+-			order by income_account"""
+-			% ", ".join(["%s"] * len(invoice_list)),
+-			tuple(inv.name for inv in invoice_list),
++		# frappe drops ORDER BY for distinct queries on postgres (db_query), so sort in python to keep
++		# the generated account-column order deterministic and identical on both backends. casefold
++		# reproduces MariaDB's case-insensitive collation order (the original raw SQL ORDER BY); plain
++		# sorted() would be case-sensitive and reorder columns vs the pre-effort MariaDB output.
++		income_accounts = sorted(
++			frappe.get_all(
++				"Sales Invoice Item",
++				filters={"docstatus": 1, "parent": ["in", [inv.name for inv in invoice_list]]},
++				pluck="income_account",
++				distinct=True,
++			),
++			key=str.casefold,
+ 		)
+ 
+ 		sales_taxes_query = get_taxes_query(invoice_list, "Sales Taxes and Charges", "Sales Invoice")
+diff --git a/erpnext/accounts/report/trial_balance/trial_balance.py b/erpnext/accounts/report/trial_balance/trial_balance.py
+index 8fb564a..4d8cd6e 100644
+--- a/erpnext/accounts/report/trial_balance/trial_balance.py
++++ b/erpnext/accounts/report/trial_balance/trial_balance.py
+@@ -4,7 +4,7 @@
+ 
+ import frappe
+ from frappe import _
+-from frappe.query_builder.functions import Sum
++from frappe.query_builder.functions import Max, Sum
+ from frappe.utils import add_days, cstr, flt, formatdate, getdate
+ 
+ import erpnext
+@@ -240,7 +240,8 @@ def get_opening_balance(
+ 		frappe.qb.from_(closing_balance)
+ 		.select(
+ 			closing_balance.account,
+-			closing_balance.account_currency,
++			# account_currency is constant per grouped account -> Max() keeps the GROUP BY postgres-valid
++			Max(closing_balance.account_currency).as_("account_currency"),
+ 			Sum(closing_balance.debit).as_("debit"),
+ 			Sum(closing_balance.credit).as_("credit"),
+ 			Sum(closing_balance.debit_in_account_currency).as_("debit_in_account_currency"),
+diff --git a/erpnext/accounts/report/voucher_wise_balance/voucher_wise_balance.py b/erpnext/accounts/report/voucher_wise_balance/voucher_wise_balance.py
+index 1918165..e02a898 100644
+--- a/erpnext/accounts/report/voucher_wise_balance/voucher_wise_balance.py
++++ b/erpnext/accounts/report/voucher_wise_balance/voucher_wise_balance.py
+@@ -3,7 +3,7 @@
+ 
+ import frappe
+ from frappe import _
+-from frappe.query_builder.functions import Sum
++from frappe.query_builder.functions import Max, Sum
+ 
+ 
+ def execute(filters=None):
+@@ -43,7 +43,13 @@ def get_data(filters):
+ 	gle = frappe.qb.DocType("GL Entry")
+ 	query = (
+ 		frappe.qb.from_(gle)
+-		.select(gle.voucher_type, gle.voucher_no, Sum(gle.debit).as_("debit"), Sum(gle.credit).as_("credit"))
++		# voucher_type is constant per grouped voucher_no -> Max() keeps the GROUP BY valid on postgres
++		.select(
++			Max(gle.voucher_type).as_("voucher_type"),
++			gle.voucher_no,
++			Sum(gle.debit).as_("debit"),
++			Sum(gle.credit).as_("credit"),
++		)
+ 		.where(gle.is_cancelled == 0)
+ 		.groupby(gle.voucher_no)
+ 	)
+diff --git a/erpnext/accounts/utils.py b/erpnext/accounts/utils.py
+index c5feb86..64e49a1 100644
+--- a/erpnext/accounts/utils.py
++++ b/erpnext/accounts/utils.py
+@@ -13,7 +13,8 @@ from frappe.desk.reportview import build_match_conditions
+ from frappe.model.meta import get_field_precision
+ from frappe.model.naming import determine_consecutive_week_number
+ from frappe.query_builder import AliasedQuery, Case, Criterion, Field, Table
+-from frappe.query_builder.functions import Count, IfNull, Max, Round, Sum
++from frappe.query_builder.custom import ConstantColumn
++from frappe.query_builder.functions import Count, IfNull, Max, Min, Round, Sum
+ from frappe.query_builder.utils import DocType
+ from frappe.utils import (
+ 	add_days,
+@@ -1724,13 +1725,15 @@ def sort_stock_vouchers_by_posting_date(
+ 	sle = frappe.qb.DocType("Stock Ledger Entry")
+ 	voucher_nos = [v[1] for v in stock_vouchers]
+ 
++	# only voucher_type/voucher_no are used downstream; order by Min() of the (per-voucher constant)
++	# posting_datetime so postgres accepts the GROUP BY without selecting non-aggregated columns
+ 	sles = (
+ 		frappe.qb.from_(sle)
+-		.select(sle.voucher_type, sle.voucher_no, sle.posting_date, sle.posting_time, sle.creation)
++		.select(sle.voucher_type, sle.voucher_no)
+ 		.where((sle.is_cancelled == 0) & (sle.voucher_no.isin(voucher_nos)))
+ 		.groupby(sle.voucher_type, sle.voucher_no)
+-		.orderby(sle.posting_datetime)
+-		.orderby(sle.creation)
++		.orderby(Min(sle.posting_datetime))
++		.orderby(Min(sle.creation))
+ 	)
+ 
+ 	if company:
+@@ -1751,25 +1754,38 @@ def get_future_stock_vouchers(posting_date, posting_time, for_warehouses=None, f
+ 
+ 	SLE = DocType("Stock Ledger Entry")
+ 
++	conditions = (SLE.posting_datetime >= posting_datetime) & (SLE.is_cancelled == 0)
++	if for_items:
++		conditions &= SLE.item_code.isin(for_items)
++	if for_warehouses:
++		conditions &= SLE.warehouse.isin(for_warehouses)
++	if company:
++		conditions &= SLE.company == company
++
++	# These SLE rows must stay locked for the duration of the repost so a concurrent stock
++	# transaction can't modify them mid-flight (the original DISTINCT ... FOR UPDATE did this).
++	# MariaDB carries the lock on the grouped query below; postgres rejects FOR UPDATE alongside
++	# GROUP BY, so lock the matching rows in a separate pass first -- the row locks are held until
++	# the surrounding transaction ends, giving the same protection. Select a constant, not the
++	# name: a deep backdated repost can match millions of rows and only the locks are needed.
++	if frappe.db.db_type == "postgres":
++		frappe.qb.from_(SLE).select(ConstantColumn(1)).where(conditions).for_update().run()
++
++	# distinct vouchers in chronological order; expressed as GROUP BY + Min() so it's valid on
++	# postgres (SELECT DISTINCT can't ORDER BY non-selected cols, and FOR UPDATE is invalid with both).
++	# posting_datetime is constant per voucher, so the ordering is unchanged vs the DISTINCT form.
+ 	query = (
+ 		frappe.qb.from_(SLE)
+ 		.select(SLE.voucher_type, SLE.voucher_no)
+-		.distinct()
+-		.where(SLE.posting_datetime >= posting_datetime)
+-		.where(SLE.is_cancelled == 0)
+-		.orderby(SLE.posting_datetime)
+-		.orderby(SLE.creation)
+-		.for_update()
++		.where(conditions)
++		.groupby(SLE.voucher_type, SLE.voucher_no)
++		.orderby(Min(SLE.posting_datetime))
++		.orderby(Min(SLE.creation))
+ 	)
+ 
+-	if for_items:
+-		query = query.where(SLE.item_code.isin(for_items))
+-
+-	if for_warehouses:
+-		query = query.where(SLE.warehouse.isin(for_warehouses))
+-
+-	if company:
+-		query = query.where(SLE.company == company)
++	# lock scanned rows on MariaDB; on postgres they were already locked above
++	if frappe.db.db_type != "postgres":
++		query = query.for_update()
+ 
+ 	future_stock_vouchers = query.run(as_dict=True)
+ 
+@@ -2216,7 +2232,7 @@ def delink_original_entry(pl_entry, partial_cancel=False):
+ 			qb.update(ple)
+ 			.set(ple.modified, now())
+ 			.set(ple.modified_by, frappe.session.user)
+-			.set(ple.delinked, True)
++			.set(ple.delinked, 1)  # smallint column; postgres rejects boolean true
+ 			.where(
+ 				(ple.company == pl_entry.company)
+ 				& (ple.account_type == pl_entry.account_type)
+@@ -2331,8 +2347,10 @@ class QueryPaymentLedger:
+ 				.where(Criterion.all(self.dimensions_filter))
+ 				.where(Criterion.all(self.voucher_posting_date))
+ 				.groupby(ple.against_voucher_type, ple.against_voucher_no, ple.party_type, ple.party)
+-				.orderby(ple.invoice_date, ple.voucher_no)
+-				.having(qb.Field("amount_in_account_currency") > 0)
++				# order by the select aliases (postgres can't ORDER BY a non-existent ple column)
++				.orderby(qb.Field("invoice_date"), qb.Field("voucher_no"))
++				# postgres HAVING can't reference a select alias; use the aggregate expression
++				.having(Sum(ple.amount_in_account_currency) > 0)
+ 				.limit(self.limit)
+ 				.run()
+ 			)
+@@ -2343,7 +2361,13 @@ class QueryPaymentLedger:
+ 				)
+ 
+ 		# build query for voucher amount
+-		query_voucher_amount = (
++		# account is grouped, not aggregated: it is a join key against the outstanding CTE below, and
++		# it fixes the currency the amounts are summed in. The two CTEs aggregate over different row
++		# sets, so two Max() picks could disagree and the join would silently miss, leaving the
++		# outstanding NULL. posting_date/due_date are dates, so Max() there cannot depend on
++		# collation. cost_center and remarks are free text that genuinely varies per row, so they
++		# come off one real row instead -- see representative below.
++		grouped_voucher_amount = (
+ 			qb.from_(ple)
+ 			.select(
+ 				ple.account,
+@@ -2351,41 +2375,64 @@ class QueryPaymentLedger:
+ 				ple.voucher_no,
+ 				ple.party_type,
+ 				ple.party,
+-				ple.posting_date,
+-				ple.due_date,
+-				ple.account_currency.as_("currency"),
+-				ple.cost_center.as_("cost_center"),
++				Max(ple.posting_date).as_("posting_date"),
++				Max(ple.due_date).as_("due_date"),
++				Max(ple.account_currency).as_("currency"),
+ 				Sum(ple.amount).as_("amount"),
+ 				Sum(ple.amount_in_account_currency).as_("amount_in_account_currency"),
+-				ple.remarks,
++				Min(ple.name).as_("representative"),
+ 			)
+ 			.where(ple.delinked == 0)
+ 			.where(Criterion.all(filter_on_voucher_no))
+ 			.where(Criterion.all(self.common_filter))
+ 			.where(Criterion.all(self.dimensions_filter))
+ 			.where(Criterion.all(self.voucher_posting_date))
+-			.groupby(ple.voucher_type, ple.voucher_no, ple.party_type, ple.party)
++			.groupby(ple.account, ple.voucher_type, ple.voucher_no, ple.party_type, ple.party)
++		).as_("grouped")
++
++		# Payment Ledger Entry has no autoname rule, so frappe names it by hash -- lower-case, which
++		# keeps Min(name) free of the collation divergence that picking Max() over free text has.
++		representative_ple = qb.DocType("Payment Ledger Entry").as_("representative_ple")
++		query_voucher_amount = (
++			qb.from_(grouped_voucher_amount)
++			.inner_join(representative_ple)
++			.on(representative_ple.name == grouped_voucher_amount.representative)
++			.select(
++				grouped_voucher_amount.account,
++				grouped_voucher_amount.voucher_type,
++				grouped_voucher_amount.voucher_no,
++				grouped_voucher_amount.party_type,
++				grouped_voucher_amount.party,
++				grouped_voucher_amount.posting_date,
++				grouped_voucher_amount.due_date,
++				grouped_voucher_amount.currency,
++				grouped_voucher_amount.amount,
++				grouped_voucher_amount.amount_in_account_currency,
++				representative_ple.cost_center.as_("cost_center"),
++				representative_ple.remarks.as_("remarks"),
++			)
+ 		)
+ 
+ 		# build query for voucher outstanding
+ 		query_voucher_outstanding = (
+ 			qb.from_(ple)
+ 			.select(
++				# grouped, not aggregated: this is the other side of the join key -- see above
+ 				ple.account,
+ 				ple.against_voucher_type.as_("voucher_type"),
+ 				ple.against_voucher_no.as_("voucher_no"),
+ 				ple.party_type,
+ 				ple.party,
+-				ple.posting_date,
+-				ple.due_date,
+-				ple.account_currency.as_("currency"),
++				Max(ple.posting_date).as_("posting_date"),
++				Max(ple.due_date).as_("due_date"),
++				Max(ple.account_currency).as_("currency"),
+ 				Sum(ple.amount).as_("amount"),
+ 				Sum(ple.amount_in_account_currency).as_("amount_in_account_currency"),
+ 			)
+ 			.where(ple.delinked == 0)
+ 			.where(Criterion.all(filter_on_against_voucher_no))
+ 			.where(Criterion.all(self.common_filter))
+-			.groupby(ple.against_voucher_type, ple.against_voucher_no, ple.party_type, ple.party)
++			.groupby(ple.account, ple.against_voucher_type, ple.against_voucher_no, ple.party_type, ple.party)
+ 		)
+ 
+ 		# build CTE for combining voucher amount and outstanding
+@@ -2427,17 +2474,19 @@ class QueryPaymentLedger:
+ 
+ 		# build CTE filter
+ 		# only fetch invoices
++		# The combined CTE query has no GROUP BY, so these are row filters. MariaDB tolerates HAVING
++		# on a select alias here, but postgres does not; express them as WHERE on the source column.
+ 		if self.get_invoices:
+ 			self.cte_query_voucher_amount_and_outstanding = (
+-				self.cte_query_voucher_amount_and_outstanding.having(
+-					qb.Field("outstanding_in_account_currency") > 0
++				self.cte_query_voucher_amount_and_outstanding.where(
++					Table("outstanding").amount_in_account_currency > 0
+ 				)
+ 			)
+ 		# only fetch payments
+ 		elif self.get_payments:
+ 			self.cte_query_voucher_amount_and_outstanding = (
+-				self.cte_query_voucher_amount_and_outstanding.having(
+-					qb.Field("outstanding_in_account_currency") < 0
++				self.cte_query_voucher_amount_and_outstanding.where(
++					Table("outstanding").amount_in_account_currency < 0
+ 				)
+ 			)
+ 

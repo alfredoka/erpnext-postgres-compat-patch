@@ -1,0 +1,223 @@
+diff --git a/erpnext/selling/report/inactive_customers/inactive_customers.py b/erpnext/selling/report/inactive_customers/inactive_customers.py
+index ea08313..b7fa738 100644
+--- a/erpnext/selling/report/inactive_customers/inactive_customers.py
++++ b/erpnext/selling/report/inactive_customers/inactive_customers.py
+@@ -5,6 +5,7 @@
+ import frappe
+ from frappe import _
+ from frappe.query_builder import Case, CustomFunction
++from pypika.terms import LiteralValue
+ from frappe.query_builder.functions import Count, Max, Sum
+ from frappe.utils import cint
+ 
+@@ -55,7 +56,13 @@ def get_sales_details(doctype):
+ 		date_col = sales_doctype.posting_date
+ 
+ 	last_order_date = Max(date_col)
+-	days_since_last_order = date_diff(current_date(), last_order_date)
++	if frappe.db.db_type == "postgres":
++		# Postgres has no DATEDIFF, and CURRENT_DATE is a bare keyword rather than a callable,
++		# so CustomFunction("CURRENT_DATE", []) renders invalid SQL. Subtracting two dates
++		# yields the integer number of days, which is what DATEDIFF returns on MariaDB.
++		days_since_last_order = LiteralValue("CURRENT_DATE") - last_order_date
++	else:
++		days_since_last_order = date_diff(current_date(), last_order_date)
+ 
+ 	return (
+ 		frappe.qb.from_(customer)
+diff --git a/erpnext/selling/report/payment_terms_status_for_sales_order/payment_terms_status_for_sales_order.py b/erpnext/selling/report/payment_terms_status_for_sales_order/payment_terms_status_for_sales_order.py
+index 89616d0..5b3a81f 100644
+--- a/erpnext/selling/report/payment_terms_status_for_sales_order/payment_terms_status_for_sales_order.py
++++ b/erpnext/selling/report/payment_terms_status_for_sales_order/payment_terms_status_for_sales_order.py
+@@ -3,7 +3,9 @@
+ 
+ import frappe
+ from frappe import _, qb, query_builder
+-from frappe.query_builder import Criterion, functions
++from frappe.query_builder import Criterion
++from frappe.query_builder.functions import Max, Sum
++from frappe.utils import flt
+ from frappe.utils.dateutils import getdate
+ 
+ 
+@@ -197,7 +199,8 @@ def get_so_with_invoices(filters):
+ 		.select(
+ 			so.customer,
+ 			so.transaction_date.as_("submitted"),
+-			ifelse(datediff(ps.due_date, functions.CurDate()) < 0, "Overdue", "Unpaid").as_("status"),
++			# CASE + a Python date is portable; MySQL's IF()/DATEDIFF()/CURDATE() don't exist on postgres
++			query_builder.Case().when(ps.due_date < getdate(), "Overdue").else_("Unpaid").as_("status"),
+ 			ps.payment_term,
+ 			ps.description,
+ 			ps.due_date,
+@@ -228,15 +231,49 @@ def get_so_with_invoices(filters):
+ 			.on(si.name == sii.parent)
+ 			.inner_join(soi)
+ 			.on(soi.name == sii.so_detail)
+-			.select(sii.sales_order, sii.parent.as_("invoice"), si.base_grand_total.as_("invoice_amount"))
++			.select(
++				# One row per (invoice, sales_order). An invoice can bill several Sales Orders; grouping
++				# by the invoice alone and taking Max(sales_order) credited the whole invoice to one
++				# arbitrary order and starved the rest. sales_order/invoice are GROUP BY keys and
++				# base_grand_total is constant per invoice; the grand total is split across the orders
++				# below in proportion to each order's net line amount on this invoice.
++				sii.sales_order.as_("sales_order"),
++				sii.parent.as_("invoice"),
++				Sum(sii.base_net_amount).as_("order_net_amount"),
++				Max(si.base_grand_total).as_("invoice_grand_total"),
++			)
+ 			.where((sii.sales_order.isin([x.name for x in sorders])) & (si.docstatus == 1))
+-			.groupby(sii.parent)
++			.groupby(sii.parent, sii.sales_order)
+ 		)
+ 		invoices = query_inv.run(as_dict=True)
++		allocate_invoice_amount_across_orders(invoices)
+ 
+ 	return sorders, invoices
+ 
+ 
++def allocate_invoice_amount_across_orders(invoices):
++	"""Split each invoice's grand total across the Sales Orders it bills, proportional to each order's net
++	line amount. A single-order invoice keeps the full grand total (ratio 1). The last order (sorted, so
++	both engines agree) absorbs the rounding residual, so the shares always sum back to the grand total."""
++	rows_by_invoice = {}
++	for row in invoices:
++		rows_by_invoice.setdefault(row.invoice, []).append(row)
++
++	for rows in rows_by_invoice.values():
++		rows.sort(key=lambda r: r.sales_order)
++		total_net = sum(flt(r.order_net_amount) for r in rows)
++		grand_total = flt(rows[0].invoice_grand_total)
++		if not total_net:
++			for r in rows:
++				r.invoice_amount = grand_total / len(rows)
++			continue
++		allocated = 0.0
++		for r in rows[:-1]:
++			r.invoice_amount = grand_total * flt(r.order_net_amount) / total_net
++			allocated += r.invoice_amount
++		rows[-1].invoice_amount = grand_total - allocated
++
++
+ def set_payment_terms_statuses(sales_orders, invoices, filters):
+ 	"""
+ 	compute status for payment terms with associated sales invoice using FIFO
+diff --git a/erpnext/selling/report/sales_analytics/sales_analytics.py b/erpnext/selling/report/sales_analytics/sales_analytics.py
+index e36690b..8adec6c 100644
+--- a/erpnext/selling/report/sales_analytics/sales_analytics.py
++++ b/erpnext/selling/report/sales_analytics/sales_analytics.py
+@@ -528,14 +528,25 @@ class Analytics:
+ 		if not frappe.db.exists("DocType", self.filters.doc_type):
+ 			frappe.throw(_("Invalid Document Type {0}").format(self.filters.doc_type))
+ 
+-		self.group_entries = frappe.db.sql(
+-			f""" select * from (select "Order Types" as name, 0 as lft,
+-			2 as rgt, '' as parent union select distinct order_type as name, 1 as lft, 1 as rgt, "Order Types" as parent
+-			from `tab{self.filters.doc_type}` where ifnull(order_type, '') != '') as b order by lft, name
+-		""",
+-			as_dict=1,
++		# frappe drops ORDER BY for distinct queries on postgres (db_query), so a SQL order_by="order_type"
++		# would be a no-op there and the leaf rows would come back unordered. Sort in python with casefold
++		# to keep the report's order-type row order deterministic, case-insensitive (matching MariaDB's
++		# collation), and identical on both engines.
++		order_types = sorted(
++			frappe.get_all(
++				self.filters.doc_type,
++				filters={"order_type": ["is", "set"]},
++				pluck="order_type",
++				distinct=True,
++			),
++			key=str.casefold,
+ 		)
+ 
++		self.group_entries = [frappe._dict(name="Order Types", lft=0, rgt=2, parent="")]
++		self.group_entries += [
++			frappe._dict(name=order_type, lft=1, rgt=1, parent="Order Types") for order_type in order_types
++		]
++
+ 		for d in self.group_entries:
+ 			if d.parent:
+ 				self.depth_map.setdefault(d.name, self.depth_map.get(d.parent) + 1)
+diff --git a/erpnext/selling/report/sales_order_analysis/sales_order_analysis.py b/erpnext/selling/report/sales_order_analysis/sales_order_analysis.py
+index 90c33c3..2d9b62b 100644
+--- a/erpnext/selling/report/sales_order_analysis/sales_order_analysis.py
++++ b/erpnext/selling/report/sales_order_analysis/sales_order_analysis.py
+@@ -60,6 +60,15 @@ def get_conditions(filters):
+ 
+ 
+ def get_data(conditions, filters):
++	# DATEDIFF is MariaDB-only; on postgres subtracting two dates yields the same integer number
++	# of days. IF() and IFNULL() are MariaDB-only too, so the CASE/COALESCE forms below are used
++	# for both engines, and the `(SELECT delay_days)` alias-reference idiom -- which postgres does
++	# not accept -- is replaced by repeating the expression.
++	delay_days = (
++		"(CURRENT_DATE - soi.delivery_date)"
++		if frappe.db.db_type == "postgres"
++		else "DATEDIFF(CURRENT_DATE, soi.delivery_date)"
++	)
+ 	data = frappe.db.sql(
+ 		f"""
+ 		SELECT
+@@ -67,15 +76,15 @@ def get_data(conditions, filters):
+ 			soi.delivery_date as delivery_date,
+ 			so.name as sales_order,
+ 			so.status, so.customer, soi.item_code,
+-			DATEDIFF(CURRENT_DATE, soi.delivery_date) as delay_days,
+-			IF(so.status in ('Completed','To Bill'), 0, (SELECT delay_days)) as delay,
++			{delay_days} as delay_days,
++			CASE WHEN so.status in ('Completed','To Bill') THEN 0 ELSE {delay_days} END as delay,
+ 			soi.qty, soi.delivered_qty,
+ 			(soi.qty - soi.delivered_qty) AS pending_qty,
+-			IFNULL(SUM(sii.qty), 0) as billed_qty,
++			COALESCE(SUM(sii.qty), 0) as billed_qty,
+ 			soi.base_amount as amount,
+ 			(soi.delivered_qty * soi.base_rate) as delivered_qty_amount,
+-			(soi.billed_amt * IFNULL(so.conversion_rate, 1)) as billed_amount,
+-			(soi.base_amount - (soi.billed_amt * IFNULL(so.conversion_rate, 1))) as pending_amount,
++			(soi.billed_amt * COALESCE(so.conversion_rate, 1)) as billed_amount,
++			(soi.base_amount - (soi.billed_amt * COALESCE(so.conversion_rate, 1))) as pending_amount,
+ 			soi.warehouse as warehouse,
+ 			so.company, soi.name,
+ 			soi.description as description
+@@ -89,7 +98,9 @@ def get_data(conditions, filters):
+ 			and so.status not in ('Stopped', 'On Hold')
+ 			and so.docstatus = 1
+ 			{conditions}
+-		GROUP BY soi.name
++		-- soi.name is the Sales Order Item PK, which licenses soi.* on postgres but not so.*;
++		-- soi.parent = so.name, so adding the Sales Order PK does not change the grouping.
++		GROUP BY soi.name, so.name
+ 		ORDER BY so.transaction_date ASC, soi.item_code ASC
+ 	""",
+ 		filters,
+@@ -112,7 +123,13 @@ def get_so_elapsed_time(data):
+ 		dn = qb.DocType("Delivery Note")
+ 		dni = qb.DocType("Delivery Note Item")
+ 
+-		to_seconds = CustomFunction("TO_SECONDS", ["date"])
++		if frappe.db.db_type == "postgres":
++			# TO_SECONDS is MariaDB-only. On postgres subtracting two dates yields days, so scale
++			# to seconds to keep the unit the callers expect.
++			elapsed_seconds = (Max(dn.posting_date) - so.transaction_date) * 86400
++		else:
++			to_seconds = CustomFunction("TO_SECONDS", ["date"])
++			elapsed_seconds = to_seconds(Max(dn.posting_date)) - to_seconds(so.transaction_date)
+ 
+ 		query = (
+ 			qb.from_(so)
+@@ -125,11 +142,13 @@ def get_so_elapsed_time(data):
+ 			.select(
+ 				so.name.as_("sales_order"),
+ 				soi.item_code.as_("so_item_code"),
+-				(to_seconds(Max(dn.posting_date)) - to_seconds(so.transaction_date)).as_("elapsed_seconds"),
++				elapsed_seconds.as_("elapsed_seconds"),
+ 			)
+ 			.where((so.name.isin(sales_orders)) & (dn.docstatus == 1))
+ 			.orderby(so.name, soi.name)
+-			.groupby(soi.name)
++			# grouping by the Sales Order Item PK licenses soi.* on postgres but not so.*; adding
++			# the Sales Order PK does not change the grouping because soi.parent = so.name.
++			.groupby(soi.name, so.name)
+ 		)
+ 		dn_elapsed_time = query.run(as_dict=True)
+ 

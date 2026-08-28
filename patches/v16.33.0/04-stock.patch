@@ -1,0 +1,916 @@
+diff --git a/erpnext/stock/deprecated_serial_batch.py b/erpnext/stock/deprecated_serial_batch.py
+index 77d6918..9e87e40 100644
+--- a/erpnext/stock/deprecated_serial_batch.py
++++ b/erpnext/stock/deprecated_serial_batch.py
+@@ -135,6 +135,23 @@ class DeprecatedBatchNoValuation:
+ 					sle.creation < self.sle.creation
+ 				)
+ 
++		conditions = (
++			(sle.item_code == self.sle.item_code)
++			& (sle.warehouse == self.sle.warehouse)
++			& (sle.batch_no.isin(self.batchwise_valuation_batches))
++			& (sle.batch_no.isnotnull())
++			& (sle.is_cancelled == 0)
++		)
++		if timestamp_condition:
++			conditions &= timestamp_condition
++		if self.sle.name:
++			conditions &= sle.name != self.sle.name
++
++		if getattr(self, "stock_closing_from_datetime", None):
++			conditions &= sle.posting_datetime >= self.stock_closing_from_datetime
++
++		# MariaDB carries a row lock on the grouped query below; on postgres the caller
++		# (calculate_avg_rate) serializes via a txn-scoped advisory lock on (item, warehouse).
+ 		query = (
+ 			frappe.qb.from_(sle)
+ 			.select(
+@@ -142,25 +159,11 @@ class DeprecatedBatchNoValuation:
+ 				Sum(sle.stock_value_difference).as_("batch_value"),
+ 				Sum(sle.actual_qty).as_("batch_qty"),
+ 			)
+-			.where(
+-				(sle.item_code == self.sle.item_code)
+-				& (sle.warehouse == self.sle.warehouse)
+-				& (sle.batch_no.isin(self.batchwise_valuation_batches))
+-				& (sle.batch_no.isnotnull())
+-				& (sle.is_cancelled == 0)
+-			)
+-			.for_update()
++			.where(conditions)
+ 			.groupby(sle.batch_no)
+ 		)
+-
+-		if timestamp_condition:
+-			query = query.where(timestamp_condition)
+-
+-		if self.sle.name:
+-			query = query.where(sle.name != self.sle.name)
+-
+-		if getattr(self, "stock_closing_from_datetime", None):
+-			query = query.where(sle.posting_datetime >= self.stock_closing_from_datetime)
++		if frappe.db.db_type != "postgres":
++			query = query.for_update()
+ 
+ 		return query.run(as_dict=True)
+ 
+@@ -257,6 +260,19 @@ class DeprecatedBatchNoValuation:
+ 				sle.creation < self.sle.creation
+ 			)
+ 
++		conditions = (
++			(sle.item_code == self.sle.item_code)
++			& (sle.warehouse == self.sle.warehouse)
++			& (sle.batch_no.isnotnull())
++			& (sle.is_cancelled == 0)
++			& (sle.batch_no.isin(self.non_batchwise_valuation_batches))
++			& timestamp_condition
++		)
++		if self.sle.name:
++			conditions &= sle.name != self.sle.name
++
++		# MariaDB carries a row lock on the grouped query below; on postgres the caller
++		# (calculate_avg_rate) serializes via a txn-scoped advisory lock on (item, warehouse).
+ 		query = (
+ 			frappe.qb.from_(sle)
+ 			.inner_join(batch)
+@@ -290,6 +306,9 @@ class DeprecatedBatchNoValuation:
+ 				query = query.where(batch.use_batchwise_valuation == 0)
+ 				moving_avg_item_non_batch_value = True
+ 
++		if frappe.db.db_type != "postgres":
++			query = query.for_update()
++
+ 		batch_data = query.run(as_dict=True)
+ 		for d in batch_data:
+ 			self.available_qty[d.batch_no] += flt(d.batch_qty)
+@@ -377,6 +396,22 @@ class DeprecatedBatchNoValuation:
+ 				bundle.creation < self.sle.creation
+ 			)
+ 
++		conditions = (
++			(bundle.item_code == self.sle.item_code)
++			& (bundle.warehouse == self.sle.warehouse)
++			& (bundle_child.batch_no.isnotnull())
++			& (bundle.is_cancelled == 0)
++			& (bundle.docstatus == 1)
++			& (bundle.type_of_transaction.isin(["Inward", "Outward"]))
++			& (bundle_child.batch_no.isin(self.non_batchwise_valuation_batches))
++			& timestamp_condition
++		)
++		if self.sle.serial_and_batch_bundle:
++			conditions &= bundle.name != self.sle.serial_and_batch_bundle
++		conditions &= bundle.voucher_type != "Pick List"
++
++		# MariaDB carries a row lock on the grouped query below; on postgres the caller
++		# (calculate_avg_rate) serializes via a txn-scoped advisory lock on (item, warehouse).
+ 		query = (
+ 			frappe.qb.from_(bundle)
+ 			.inner_join(bundle_child)
+@@ -416,6 +451,9 @@ class DeprecatedBatchNoValuation:
+ 				query = query.where(batch.use_batchwise_valuation == 0)
+ 				moving_avg_item_non_batch_value = True
+ 
++		if frappe.db.db_type != "postgres":
++			query = query.for_update()
++
+ 		batch_data = query.run(as_dict=True)
+ 		for d in batch_data:
+ 			self.available_qty[d.batch_no] += flt(d.batch_qty)
+diff --git a/erpnext/stock/doctype/pick_list/pick_list.py b/erpnext/stock/doctype/pick_list/pick_list.py
+index 5fd8f33..531e4e6 100644
+--- a/erpnext/stock/doctype/pick_list/pick_list.py
++++ b/erpnext/stock/doctype/pick_list/pick_list.py
+@@ -9,8 +9,7 @@ import frappe
+ from frappe import _, bold
+ from frappe.model.mapper import map_child_doc
+ from frappe.query_builder import Case
+-from frappe.query_builder.custom import GROUP_CONCAT
+-from frappe.query_builder.functions import Coalesce, Locate, Replace, Sum
++from frappe.query_builder.functions import Coalesce, GroupConcat, Locate, Max, Replace, Sum
+ from frappe.utils import ceil, cint, floor, flt, get_link_to_form
+ from frappe.utils.nestedset import get_descendants_of
+ 
+@@ -1859,6 +1858,9 @@ def get_pick_list_query(doctype, txt, searchfield, start, page_len, filters):
+ 	PICK_LIST_ITEM = frappe.qb.DocType("Pick List Item")
+ 	SALES_ORDER = frappe.qb.DocType("Sales Order")
+ 
++	# GROUP_CONCAT is MariaDB-only; frappe's GroupConcat dispatches to STRING_AGG on postgres.
++	sales_orders = GroupConcat(PICK_LIST_ITEM.sales_order).distinct()
++
+ 	query = (
+ 		frappe.qb.from_(PICK_LIST)
+ 		.join(PICK_LIST_ITEM)
+@@ -1867,8 +1869,11 @@ def get_pick_list_query(doctype, txt, searchfield, start, page_len, filters):
+ 		.on(PICK_LIST_ITEM.sales_order == SALES_ORDER.name)
+ 		.select(
+ 			PICK_LIST.name,
+-			SALES_ORDER.customer,
+-			Replace(GROUP_CONCAT(PICK_LIST_ITEM.sales_order).distinct(), ",", "<br>").as_("sales_order"),
++			# customer comes from Sales Order, so grouping by the Pick List PK does not license it
++			# on postgres (functional dependency is not inferred across a join). The WHERE below
++			# pins it to a single value anyway, so Max() cannot change the result.
++			Max(SALES_ORDER.customer).as_("customer"),
++			Replace(sales_orders, ",", "<br>").as_("sales_order"),
+ 		)
+ 		.where(PICK_LIST.docstatus == 1)
+ 		.where(PICK_LIST.status.isin(["Open", "Partly Delivered"]))
+diff --git a/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py b/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py
+index fc19b46..66e239a 100644
+--- a/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py
++++ b/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py
+@@ -2,16 +2,16 @@
+ # For license information, please see license.txt
+ 
+ import collections
+-import csv
+ import json
+ from collections import Counter, defaultdict
++from typing import Any
+ 
+ import frappe
+ import frappe.query_builder
+ from frappe import _, _dict, bold
+ from frappe.model.document import Document
+ from frappe.model.naming import make_autoname
+-from frappe.query_builder.functions import Concat_ws, Sum
++from frappe.query_builder.functions import Concat_ws, Max, Sum
+ from frappe.utils import (
+ 	cint,
+ 	cstr,
+@@ -1883,8 +1883,29 @@ class SerialandBatchBundle(Document):
+ 		self.set("entries", [])
+ 
+ 
++def on_doctype_update():
++	if frappe.db.db_type == "postgres":
++		# Bundle-direct lookups (get_ledgers_from_serial_batch_bundle, get_picked_*) always filter
++		# `is_cancelled = 0` and scope by voucher_no or item_code+warehouse -- none of which the parent
++		# bundle is otherwise indexed on (only voucher_type/voucher_detail_no are). Partial indexes keep
++		# only the active bundles. Postgres-only (`where` is a no-op on MariaDB, and MariaDB's optimizer
++		# ignores partial predicates anyway).
++		frappe.db.add_index(
++			"Serial and Batch Bundle",
++			["voucher_no"],
++			index_name="sabb_active_voucher",
++			where="is_cancelled = 0",
++		)
++		frappe.db.add_index(
++			"Serial and Batch Bundle",
++			["item_code", "warehouse"],
++			index_name="sabb_active_item_wh",
++			where="is_cancelled = 0",
++		)
++
++
+ @frappe.whitelist()
+-def download_blank_csv_template(content):
++def download_blank_csv_template(content: str | list):
+ 	csv_data = []
+ 	if isinstance(content, str):
+ 		content = parse_json(content)
+@@ -3196,7 +3217,7 @@ def get_available_batches(kwargs):
+ 			batch_ledger.batch_no,
+ 			batch_ledger.warehouse,
+ 			Sum(batch_ledger.qty).as_("qty"),
+-			batch_table.expiry_date,
++			Max(batch_table.expiry_date).as_("expiry_date"),
+ 		)
+ 		.where(batch_table.disabled == 0)
+ 		.where(stock_ledger_entry.is_cancelled == 0)
+@@ -3236,12 +3257,13 @@ def get_available_batches(kwargs):
+ 		else:
+ 			query = query.where(batch_ledger.batch_no == kwargs.batch_no)
+ 
++	# order by aggregates (one row per batch_no+warehouse); raw columns aren't valid under GROUP BY on postgres
+ 	if kwargs.based_on == "LIFO":
+-		query = query.orderby(batch_table.creation, order=frappe.qb.desc)
++		query = query.orderby(Max(batch_table.creation), order=frappe.qb.desc)
+ 	elif kwargs.based_on == "Expiry":
+-		query = query.orderby(batch_table.expiry_date)
++		query = query.orderby(Max(batch_table.expiry_date))
+ 	else:
+-		query = query.orderby(batch_table.creation)
++		query = query.orderby(Max(batch_table.creation))
+ 
+ 	if kwargs.get("ignore_voucher_nos"):
+ 		query = query.where(stock_ledger_entry.voucher_no.notin(kwargs.get("ignore_voucher_nos")))
+@@ -3458,6 +3480,10 @@ def get_stock_ledgers_for_serial_nos(kwargs):
+ 			stock_ledger_entry.actual_qty,
+ 			stock_ledger_entry.serial_no,
+ 			stock_ledger_entry.serial_and_batch_bundle,
++			# creation is the ORDER BY tiebreaker; postgres requires ORDER BY columns to be in the
++			# select list when the query is DISTINCT (added below for serial-no filters). It is unique
++			# per SLE so it doesn't change the distinct row set (serial_and_batch_bundle already is).
++			stock_ledger_entry.creation,
+ 		)
+ 		.where(stock_ledger_entry.is_cancelled == 0)
+ 		.orderby(stock_ledger_entry.posting_datetime)
+@@ -3524,10 +3550,10 @@ def get_stock_ledgers_batches(kwargs):
+ 		.on(stock_ledger_entry.batch_no == batch_table.name)
+ 		.select(
+ 			stock_ledger_entry.warehouse,
+-			stock_ledger_entry.item_code,
++			Max(stock_ledger_entry.item_code).as_("item_code"),
+ 			Sum(stock_ledger_entry.actual_qty).as_("qty"),
+ 			stock_ledger_entry.batch_no,
+-			batch_table.expiry_date,
++			Max(batch_table.expiry_date).as_("expiry_date"),
+ 		)
+ 		.where((stock_ledger_entry.is_cancelled == 0) & (stock_ledger_entry.batch_no.isnotnull()))
+ 		.groupby(stock_ledger_entry.batch_no, stock_ledger_entry.warehouse)
+@@ -3563,12 +3589,13 @@ def get_stock_ledgers_batches(kwargs):
+ 	if kwargs.get("ignore_voucher_nos"):
+ 		query = query.where(stock_ledger_entry.voucher_no.notin(kwargs.get("ignore_voucher_nos")))
+ 
++	# order by aggregates (one row per batch_no+warehouse); raw columns aren't valid under GROUP BY on postgres
+ 	if kwargs.based_on == "LIFO":
+-		query = query.orderby(batch_table.creation, order=frappe.qb.desc)
++		query = query.orderby(Max(batch_table.creation), order=frappe.qb.desc)
+ 	elif kwargs.based_on == "Expiry":
+-		query = query.orderby(batch_table.expiry_date)
++		query = query.orderby(Max(batch_table.expiry_date))
+ 	else:
+-		query = query.orderby(batch_table.creation)
++		query = query.orderby(Max(batch_table.creation))
+ 
+ 	data = query.run(as_dict=True)
+ 	batches = {}
+diff --git a/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py b/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py
+index 4f6919e..6b77c5b 100644
+--- a/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py
++++ b/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py
+@@ -2,20 +2,21 @@
+ # License: GNU General Public License v3. See license.txt
+ 
+ 
++import re
+ from datetime import date
+ 
+ import frappe
+-from frappe import _, bold
++from frappe import _
+ from frappe.core.doctype.role.role import get_users
+ from frappe.model.document import Document
+-from frappe.query_builder.functions import Sum
++from frappe.query_builder.functions import Concat_ws, Max, Sum
+ from frappe.utils import add_days, cint, flt, formatdate, get_datetime, getdate
+ 
+ from erpnext.accounts.utils import get_fiscal_year
+ from erpnext.controllers.item_variant import ItemTemplateCannotHaveStock
+ from erpnext.stock.doctype.inventory_dimension.inventory_dimension import get_inventory_dimensions
+-from erpnext.stock.serial_batch_bundle import SerialBatchBundle
+-from erpnext.stock.stock_ledger import get_previous_sle
++from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos as get_parsed_serial_nos
++from erpnext.stock.serial_batch_bundle import SerialBatchBundle, get_serial_nos
+ 
+ 
+ class StockFreezeError(frappe.ValidationError):
+@@ -312,13 +313,17 @@ class StockLedgerEntry(Document):
+ 		if authorized_role:
+ 			authorized_users = get_users(authorized_role)
+ 			if authorized_users and frappe.session.user not in authorized_users:
+-				last_transaction_time = frappe.db.sql(
+-					"""
+-					select MAX(timestamp(posting_date, posting_time)) as posting_time
+-					from `tabStock Ledger Entry`
+-					where docstatus = 1 and is_cancelled = 0 and item_code = %s
+-					and warehouse = %s""",
+-					(self.item_code, self.warehouse),
++				sle = frappe.qb.DocType("Stock Ledger Entry")
++				last_transaction_time = (
++					frappe.qb.from_(sle)
++					.select(Max(sle.posting_datetime))
++					.where(
++						(sle.docstatus == 1)
++						& (sle.is_cancelled == 0)
++						& (sle.item_code == self.item_code)
++						& (sle.warehouse == self.warehouse)
++					)
++					.run()
+ 				)[0][0]
+ 
+ 				cur_doc_posting_datetime = "{} {}".format(
+@@ -352,3 +357,15 @@ class StockLedgerEntry(Document):
+ def on_doctype_update():
+ 	frappe.db.add_index("Stock Ledger Entry", ["voucher_no", "voucher_type"])
+ 	frappe.db.add_index("Stock Ledger Entry", ["item_code", "warehouse", "posting_datetime", "creation"])
++
++	if frappe.db.db_type == "postgres":
++		# Postgres-only partial index for date-range stock reports (Stock Ledger / Stock Balance)
++		# that scan across all items: they filter `is_cancelled = 0` and sort by posting_datetime.
++		# The existing item_code-leading composite can't serve an all-items date scan. `where` is a
++		# no-op on MariaDB, so this is added only on postgres.
++		frappe.db.add_index(
++			"Stock Ledger Entry",
++			["company", "posting_datetime", "creation"],
++			index_name="sle_active_posting",
++			where="is_cancelled = 0",
++		)
+diff --git a/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py b/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py
+index d01434f..8a9678d 100644
+--- a/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py
++++ b/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py
+@@ -8,10 +8,10 @@ import frappe
+ from frappe import _
+ from frappe.model.document import Document
+ from frappe.query_builder import Case
+-from frappe.query_builder.functions import Sum
+-from frappe.utils import cint, flt, nowdate, nowtime, parse_json
++from frappe.query_builder.functions import Max, Min, Sum
++from frappe.utils import cint, flt, get_datetime, now_datetime, nowdate, nowtime, parse_json
+ 
+-from erpnext.stock.utils import get_or_make_bin, get_stock_balance
++from erpnext.stock.utils import get_combine_datetime, get_or_make_bin, get_stock_balance
+ 
+ 
+ class StockReservationEntry(Document):
+@@ -700,20 +700,37 @@ def get_available_qty_to_reserve(
+ 
+ 	if available_qty:
+ 		sre = frappe.qb.DocType("Stock Reservation Entry")
++		conditions = (
++			(sre.docstatus == 1)
++			& (sre.item_code == item_code)
++			& (sre.warehouse == warehouse)
++			& (sre.delivered_qty < sre.reserved_qty)
++		)
++		if ignore_sre:
++			conditions &= sre.name != ignore_sre
++
++		# Lock the rows being aggregated so a concurrent reservation can't change them mid-transaction.
++		# MariaDB carries the lock on the aggregate query itself (its gap locks also serialize two
++		# FIRST reservations, when no SRE rows exist yet); postgres has no gap locks, so gate on the
++		# Bin row (exists once there is stock), then lock the matching SREs in a plain SELECT.
++		if frappe.db.db_type == "postgres":
++			bin_table = frappe.qb.DocType("Bin")
++			(
++				frappe.qb.from_(bin_table)
++				.select(bin_table.name)
++				.where((bin_table.item_code == item_code) & (bin_table.warehouse == warehouse))
++				.for_update()
++				.run()
++			)
++			frappe.qb.from_(sre).select(sre.name).where(conditions).orderby(sre.name).for_update().run()
++
+ 		query = (
+ 			frappe.qb.from_(sre)
+ 			.select(Sum(sre.reserved_qty - sre.delivered_qty - sre.transferred_qty - sre.consumed_qty))
+-			.where(
+-				(sre.docstatus == 1)
+-				& (sre.item_code == item_code)
+-				& (sre.warehouse == warehouse)
+-				& (sre.delivered_qty < sre.reserved_qty)
+-			)
+-			.for_update()
++			.where(conditions)
+ 		)
+-
+-		if ignore_sre:
+-			query = query.where(sre.name != ignore_sre)
++		if frappe.db.db_type != "postgres":
++			query = query.for_update()
+ 
+ 		reserved_qty = query.run()[0][0] or 0.0
+ 
+@@ -866,14 +883,16 @@ def get_sre_reserved_warehouses_for_voucher(
+ 	query = (
+ 		frappe.qb.from_(sre)
+ 		.select(sre.warehouse)
+-		.distinct()
+ 		.where(
+ 			(sre.docstatus == 1)
+ 			& (sre.voucher_type == voucher_type)
+ 			& (sre.voucher_no == voucher_no)
+ 			& (sre.delivered_qty < sre.reserved_qty)
+ 		)
+-		.orderby(sre.creation)
++		# distinct warehouses, earliest reservation first (postgres can't ORDER BY a
++		# non-selected column under SELECT DISTINCT, so group + Min instead)
++		.groupby(sre.warehouse)
++		.orderby(Min(sre.creation))
+ 	)
+ 
+ 	if voucher_detail_no:
+@@ -980,7 +999,8 @@ def get_sre_reserved_batch_nos_details(item_code: str, warehouse: str, batch_nos
+ 			& (sre.reservation_based_on == "Serial and Batch")
+ 		)
+ 		.groupby(sb_entry.batch_no)
+-		.orderby(sb_entry.creation)
++		# result is collapsed into a dict below, so ordering is irrelevant; dropping the (non-grouped)
++		# ORDER BY creation keeps the GROUP BY valid on postgres.
+ 	)
+ 
+ 	if batch_nos:
+@@ -1524,10 +1544,12 @@ class StockReservation:
+ 			.inner_join(child_doctype)
+ 			.on(doctype.name == child_doctype.parent)
+ 			.select(
+-				doctype.name.as_("voucher_no"),
++				# grouped by the child PK (name), so child columns are valid on postgres via functional
++				# dependency; the parent (doctype) columns aren't, so Max() them -- constant per child row.
++				Max(doctype.name).as_("voucher_no"),
+ 				child_doctype.name.as_("voucher_detail_no"),
+ 				child_doctype[item_code_fieldname].as_("item_code"),
+-				doctype.company,
++				Max(doctype.company).as_("company"),
+ 				child_doctype.stock_uom,
+ 			)
+ 			.where((doctype.docstatus == 1) & (doctype[field].isin(docnames)))
+@@ -1537,9 +1559,9 @@ class StockReservation:
+ 		if to_doctype == "Work Order":
+ 			query = query.select(
+ 				child_doctype.source_warehouse,
+-				doctype.wip_warehouse,
+-				doctype.skip_transfer,
+-				doctype.from_wip_warehouse,
++				Max(doctype.wip_warehouse).as_("wip_warehouse"),
++				Max(doctype.skip_transfer).as_("skip_transfer"),
++				Max(doctype.from_wip_warehouse).as_("from_wip_warehouse"),
+ 				child_doctype.required_qty,
+ 				(child_doctype.required_qty - child_doctype.transferred_qty).as_("qty"),
+ 				child_doctype.stock_reserved_qty,
+diff --git a/erpnext/stock/report/available_batch_report/available_batch_report.py b/erpnext/stock/report/available_batch_report/available_batch_report.py
+index 84a6714..841f448 100644
+--- a/erpnext/stock/report/available_batch_report/available_batch_report.py
++++ b/erpnext/stock/report/available_batch_report/available_batch_report.py
+@@ -107,7 +107,9 @@ def get_batchwise_data_from_stock_ledger(filters):
+ 			Sum(table.actual_qty).as_("balance_qty"),
+ 		)
+ 		.where(table.is_cancelled == 0)
+-		.groupby(table.batch_no, table.item_code, table.warehouse)
++		# batch.expiry_date comes from the Batch table; postgres requires its PK in the GROUP BY for
++		# it to be selectable. batch.name is 1:1 with the grouped batch_no, so groups are unchanged.
++		.groupby(table.batch_no, table.item_code, table.warehouse, batch.name)
+ 	)
+ 
+ 	query = get_query_based_on_filters(query, batch, table, filters)
+@@ -138,7 +140,10 @@ def get_batchwise_data_from_serial_batch_bundle(batchwise_data, filters):
+ 			Sum(ch_table.qty).as_("balance_qty"),
+ 		)
+ 		.where((table.is_cancelled == 0) & (table.docstatus == 1))
+-		.groupby(ch_table.batch_no, table.item_code, ch_table.warehouse)
++		# Group by the same (SLE) warehouse that is selected -- the original grouped by
++		# ch_table.warehouse while selecting table.warehouse, which postgres rejects. Also group by
++		# the Batch PK so batch.expiry_date is selectable (1:1 with the grouped batch_no).
++		.groupby(ch_table.batch_no, table.item_code, table.warehouse, batch.name)
+ 	)
+ 
+ 	query = get_query_based_on_filters(query, batch, table, filters)
+diff --git a/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py b/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py
+index 0315481..a0b2bef 100644
+--- a/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py
++++ b/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py
+@@ -137,7 +137,8 @@ def get_stock_ledger_entries_for_batch_no(filters):
+ 			sle.item_code,
+ 			sle.warehouse,
+ 			sle.batch_no,
+-			sle.posting_date,
++			# posting_date is constant per voucher_no (grouped) -> Max() is unchanged and postgres-valid
++			fn.Max(sle.posting_date).as_("posting_date"),
+ 			fn.Sum(sle.actual_qty).as_("actual_qty"),
+ 			fn.Sum(sle.stock_value_difference).as_("stock_value_difference"),
+ 		)
+@@ -182,10 +183,13 @@ def get_stock_ledger_entries_for_batch_bundle(filters):
+ 		.inner_join(batch_package)
+ 		.on(batch_package.parent == sle.serial_and_batch_bundle)
+ 		.select(
+-			sle.item_code,
+-			sle.warehouse,
++			# item_code/warehouse/posting_date are constant per grouped voucher_no+batch_no+warehouse
++			# (a batch belongs to one item; warehouse mirrors the grouped batch_package.warehouse;
++			# a voucher has one posting_date) -> Max() is unchanged and postgres-valid
++			fn.Max(sle.item_code).as_("item_code"),
++			fn.Max(sle.warehouse).as_("warehouse"),
+ 			batch_package.batch_no,
+-			sle.posting_date,
++			fn.Max(sle.posting_date).as_("posting_date"),
+ 			fn.Sum(batch_package.qty).as_("actual_qty"),
+ 			fn.Sum(batch_package.stock_value_difference).as_("stock_value_difference"),
+ 		)
+diff --git a/erpnext/stock/report/product_bundle_balance/product_bundle_balance.py b/erpnext/stock/report/product_bundle_balance/product_bundle_balance.py
+index 34be8fc..ecb7a36 100644
+--- a/erpnext/stock/report/product_bundle_balance/product_bundle_balance.py
++++ b/erpnext/stock/report/product_bundle_balance/product_bundle_balance.py
+@@ -6,7 +6,6 @@ import frappe
+ from frappe import _
+ from frappe.query_builder.functions import IfNull, Max
+ from frappe.utils import flt
+-from pypika.terms import ExistsCriterion
+ 
+ from erpnext.stock.report.stock_ledger.stock_ledger import get_item_group_condition
+ 
+@@ -248,11 +247,13 @@ def get_stock_ledger_entries(filters, items):
+ 
+ 
+ def get_item_wise_max_posting_datetime(filters, items):
+-	"""Get the maximum Stock Ledger Entry name for the given filters and items."""
++	"""Get the latest posting datetime per item+warehouse for the given filters and items."""
+ 	sle = frappe.qb.DocType("Stock Ledger Entry")
+ 	query = (
+ 		frappe.qb.from_(sle)
+-		.select(sle.item_code, sle.warehouse, sle.name, Max(sle.posting_datetime).as_("posting_datetime"))
++		# `name` was selected but never read by the caller (the join below only uses item_code,
++		# warehouse and posting_datetime); drop it so the GROUP BY is valid on postgres.
++		.select(sle.item_code, sle.warehouse, Max(sle.posting_datetime).as_("posting_datetime"))
+ 		.where(sle.item_code.isin(items) & (sle.is_cancelled == 0))
+ 		.groupby(sle.item_code, sle.warehouse)
+ 	)
+diff --git a/erpnext/stock/report/stock_ageing/stock_ageing.py b/erpnext/stock/report/stock_ageing/stock_ageing.py
+index 83ecd4b..06663bd 100644
+--- a/erpnext/stock/report/stock_ageing/stock_ageing.py
++++ b/erpnext/stock/report/stock_ageing/stock_ageing.py
+@@ -7,7 +7,14 @@ from operator import itemgetter
+ 
+ import frappe
+ from frappe import _
+-from frappe.query_builder.functions import Abs, Count
++from frappe.query_builder import CustomFunction
++from frappe.query_builder.functions import Count
++
++# pypika ships Abs as an AggregateFunction, which makes frappe treat a query with a scalar
++# ABS(...) select as an aggregate one. On postgres that wraps the default ORDER BY in MAX(),
++# turning the statement into an implicit aggregate and breaking the non-grouped ABS column.
++# ABS is scalar, so declare it as a plain function. (frappe 17 fixes this upstream.)
++Abs = CustomFunction("ABS", ["term"])
+ from frappe.utils import cint, date_diff, flt, get_datetime
+ 
+ from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
+@@ -314,16 +321,27 @@ class FIFOSlots:
+ 			self._prefetch_batchwise_valuations()
+ 			self._prefetch_valuation_methods()
+ 
+-		with frappe.db.unbuffered_cursor():
+-			if stock_ledger_entries is None:
+-				stock_ledger_entries = self._get_stock_ledger_entries()
++			if frappe.db.db_type == "postgres":
++				# postgres server-side cursors can't run nested queries mid-iteration; _get_stock_ledger_entries
++				# returns a buffered result there, so process it directly (no unbuffered cursor).
++				for row in self._get_stock_ledger_entries():
++					self._process_stock_ledger_entry(row, bundle_wise_serial_nos, bundle_wise_batch_nos)
++			else:
++				with frappe.db.unbuffered_cursor():
++					stock_ledger_entries = self._get_stock_ledger_entries()
++
++					for row in stock_ledger_entries:
++						self._process_stock_ledger_entry(row, bundle_wise_serial_nos, bundle_wise_batch_nos)
+ 
++					# Note that stock_ledger_entries is an iterator, you can not reuse it like a list
++					del stock_ledger_entries
++		else:
++			# entries passed in directly as a list: no streaming cursor is opened, so the batchwise
++			# valuation flags can be resolved lazily — a nested get_value here is safe on postgres too
++			# (running it inside an unbuffered/named cursor would raise on postgres).
+ 			for row in stock_ledger_entries:
+ 				self._process_stock_ledger_entry(row, bundle_wise_serial_nos, bundle_wise_batch_nos)
+ 
+-			# Note that stock_ledger_entries is an iterator, you can not reuse it like a list
+-			del stock_ledger_entries
+-
+ 		self._recompute_moving_average_slots()
+ 		self._rebalance_batch_slots()
+ 
+@@ -1068,7 +1086,9 @@ class FIFOSlots:
+ 
+ 		sle_query = sle_query.orderby(sle.posting_datetime, sle.creation)
+ 
+-		return sle_query.run(as_dict=True, as_iterator=True)
++		# postgres server-side (named) cursors can't run nested queries mid-iteration, which
++		# _process_stock_ledger_entry needs; fall back to a buffered fetch there. MariaDB streams.
++		return sle_query.run(as_dict=True, as_iterator=frappe.db.db_type != "postgres")
+ 
+ 	def _get_bundle_wise_serial_nos(self) -> dict:
+ 		bundle = frappe.qb.DocType("Serial and Batch Bundle")
+diff --git a/erpnext/stock/report/stock_and_account_value_comparison/stock_and_account_value_comparison.py b/erpnext/stock/report/stock_and_account_value_comparison/stock_and_account_value_comparison.py
+index fe14169..ac0b61c 100644
+--- a/erpnext/stock/report/stock_and_account_value_comparison/stock_and_account_value_comparison.py
++++ b/erpnext/stock/report/stock_and_account_value_comparison/stock_and_account_value_comparison.py
+@@ -91,12 +91,14 @@ def get_stock_ledger_data(report_filters, filters):
+ 		"Stock Ledger Entry",
+ 		filters=filters,
+ 		fields=[
+-			"name",
++			# name is arbitrary per grouped voucher (many SLEs); posting_date/posting_time are constant
++			# per voucher -> MAX() keeps the GROUP BY valid on postgres with the same values MySQL picked.
++			{"MAX": "name", "as": "name"},
+ 			"voucher_type",
+ 			"voucher_no",
+ 			{"SUM": "stock_value_difference", "as": "stock_value"},
+-			"posting_date",
+-			"posting_time",
++			{"MAX": "posting_date", "as": "posting_date"},
++			{"MAX": "posting_time", "as": "posting_time"},
+ 		],
+ 		group_by="voucher_type, voucher_no",
+ 		order_by="posting_date ASC, posting_time ASC",
+@@ -118,10 +120,12 @@ def get_gl_data(report_filters, filters):
+ 		"GL Entry",
+ 		filters=filters,
+ 		fields=[
+-			"name",
++			# name is arbitrary per grouped voucher (many GL entries); posting_date is constant per
++			# voucher -> MAX() keeps the GROUP BY valid on postgres with the same values MySQL picked.
++			{"MAX": "name", "as": "name"},
+ 			"voucher_type",
+ 			"voucher_no",
+-			"posting_date",
++			{"MAX": "posting_date", "as": "posting_date"},
+ 			{
+ 				"SUB": [{"SUM": "debit_in_account_currency"}, {"SUM": "credit_in_account_currency"}],
+ 				"as": "account_value",
+diff --git a/erpnext/stock/report/total_stock_summary/total_stock_summary.py b/erpnext/stock/report/total_stock_summary/total_stock_summary.py
+index 4848c21..9d6bda6 100644
+--- a/erpnext/stock/report/total_stock_summary/total_stock_summary.py
++++ b/erpnext/stock/report/total_stock_summary/total_stock_summary.py
+@@ -4,7 +4,7 @@
+ 
+ import frappe
+ from frappe import _
+-from frappe.query_builder.functions import Sum
++from frappe.query_builder.functions import Max, Sum
+ 
+ 
+ def execute(filters=None):
+@@ -53,8 +53,9 @@ def get_total_stock(filters):
+ 	else:
+ 		query = query.select(wh.company).groupby(wh.company)
+ 
+-	query = query.select(item.item_code, item.description, Sum(bin.actual_qty).as_("actual_qty")).groupby(
+-		item.item_code
+-	)
++	# description is constant per grouped item_code -> Max() keeps the GROUP BY valid on postgres
++	query = query.select(
++		item.item_code, Max(item.description).as_("description"), Sum(bin.actual_qty).as_("actual_qty")
++	).groupby(item.item_code)
+ 
+ 	return query.run()
+diff --git a/erpnext/stock/serial_batch_bundle.py b/erpnext/stock/serial_batch_bundle.py
+index e8e674e..e487a94 100644
+--- a/erpnext/stock/serial_batch_bundle.py
++++ b/erpnext/stock/serial_batch_bundle.py
+@@ -2,10 +2,9 @@ from collections import defaultdict
+ 
+ import frappe
+ from frappe import _, bold
+-from frappe.model.naming import NamingSeries, make_autoname, parse_naming_series
+-from frappe.query_builder import Case
+-from frappe.query_builder.functions import Max, Sum, Timestamp
+-from frappe.utils import add_days, cint, cstr, flt, get_link_to_form, getdate, now, nowtime, today
++from frappe.model.naming import NamingSeries, parse_naming_series
++from frappe.query_builder.functions import Max, Sum
++from frappe.utils import add_days, cint, cstr, flt, get_link_to_form, getdate, now
+ from pypika import Order
+ from pypika.terms import ExistsCriterion
+ 
+@@ -823,6 +822,15 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
+ 				"Serial and Batch Bundle", self.sle.serial_and_batch_bundle, "total_amount"
+ 			)
+ 		else:
++			# Serialize concurrent valuations of this (item, warehouse) on postgres. MariaDB's
++			# grouped FOR UPDATE + gap locks do this via the history reads below; postgres has no
++			# gap locks, and row-locking the whole history writes a lock marker on every tuple --
++			# a txn-scoped advisory lock (released at commit/rollback) serializes without either.
++			if frappe.db.db_type == "postgres":
++				frappe.db.transaction_advisory_lock(
++					("batch-valuation", self.sle.item_code, self.sle.warehouse)
++				)
++
+ 			self.stock_value_change = 0.0
+ 			self.batch_avg_rate = defaultdict(float)
+ 			self.available_qty = defaultdict(float)
+@@ -931,36 +939,42 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
+ 
+ 			timestamp_condition |= (child.posting_datetime == self.sle.posting_datetime) & tie_condition
+ 
+-		query = (
+-			frappe.qb.from_(child)
+-			.select(
+-				child.batch_no,
+-				Sum(child.stock_value_difference).as_("incoming_rate"),
+-				Sum(child.qty).as_("qty"),
+-			)
+-			.where(
+-				(child.item_code == self.sle.item_code)
+-				& (child.warehouse == self.sle.warehouse)
+-				& (child.batch_no.isin(self.batchwise_valuation_batches))
+-				& (child.docstatus == 1)
+-				& (child.type_of_transaction.isin(["Inward", "Outward"]))
+-			)
+-			.for_update()
+-			.groupby(child.batch_no)
++		conditions = (
++			(child.item_code == self.sle.item_code)
++			& (child.warehouse == self.sle.warehouse)
++			& (child.batch_no.isin(self.batchwise_valuation_batches))
++			& (child.docstatus == 1)
++			& (child.type_of_transaction.isin(["Inward", "Outward"]))
+ 		)
+ 
+ 		# Important to exclude the current voucher detail no / voucher no to calculate the correct stock value difference
+ 		if self.sle.voucher_detail_no:
+-			query = query.where(child.voucher_detail_no != self.sle.voucher_detail_no)
++			conditions &= child.voucher_detail_no != self.sle.voucher_detail_no
+ 		elif self.sle.voucher_no:
+-			query = query.where(child.voucher_no != self.sle.voucher_no)
++			conditions &= child.voucher_no != self.sle.voucher_no
+ 
+-		query = query.where(child.voucher_type != "Pick List")
++		conditions &= child.voucher_type != "Pick List"
+ 		if timestamp_condition:
+-			query = query.where(timestamp_condition)
++			conditions &= timestamp_condition
+ 
+ 		if self.stock_closing_from_datetime:
+-			query = query.where(child.posting_datetime >= self.stock_closing_from_datetime)
++			conditions &= child.posting_datetime >= self.stock_closing_from_datetime
++
++		# MariaDB carries a row lock on the grouped query below; on postgres the caller
++		# (calculate_avg_rate) serializes via a txn-scoped advisory lock on (item, warehouse)
++		# instead of row-locking the whole history (FOR UPDATE is invalid with GROUP BY there).
++		query = (
++			frappe.qb.from_(child)
++			.select(
++				child.batch_no,
++				Sum(child.stock_value_difference).as_("incoming_rate"),
++				Sum(child.qty).as_("qty"),
++			)
++			.where(conditions)
++			.groupby(child.batch_no)
++		)
++		if frappe.db.db_type != "postgres":
++			query = query.for_update()
+ 
+ 		return query.run(as_dict=True)
+ 
+diff --git a/erpnext/stock/stock_ledger.py b/erpnext/stock/stock_ledger.py
+index 9710c05..e4caf1d 100644
+--- a/erpnext/stock/stock_ledger.py
++++ b/erpnext/stock/stock_ledger.py
+@@ -5,16 +5,15 @@ import copy
+ import gzip
+ import json
+ from collections import deque
++from contextlib import nullcontext
+ 
+ import frappe
+ from frappe import _, bold, scrub
+ from frappe.model.meta import get_field_precision
+ from frappe.query_builder import Order
+-from frappe.query_builder.functions import Sum
++from frappe.query_builder.functions import Lower, NullIf, Sum
+ from frappe.utils import (
+-	add_to_date,
+ 	cint,
+-	cstr,
+ 	flt,
+ 	format_date,
+ 	get_datetime,
+@@ -240,6 +239,41 @@ def make_entry(args, allow_negative_stock=False, via_landed_cost_voucher=False):
+ 	return sle
+ 
+ 
++# A repost waits this long for another repost's per-(item, warehouse) gate before giving up. Kept
++# well under the 1800s repost job timeout so a wait can't burn the whole budget, and short enough
++# that a contended worker re-queues (recoverable QueryTimeoutError) and frees the slot for other
++# items instead of pinning it.
++REPOST_LOCK_TIMEOUT = 300
++
++
++def repost_gate(item_code, warehouse):
++	"""Serialize concurrent background reposts of the same (item, warehouse) with a session-level
++	advisory lock taken before the inner `... for update` row locks, so they take turns instead of
++	racing into a lock-order deadlock. Row locks still enforce correctness; this only cuts the
++	deadlock/retry churn. Scope is repost-vs-repost only -- the synchronous repost_current_voucher
++	submit path is deliberately not gated (blocking a submit behind a background repost would be a
++	worse regression) and keeps relying on the existing deadlock retry. Postgres only: MariaDB
++	keeps the plain deadlock-retry path."""
++	# hasattr keeps this a graceful opt-in: on an ERPNext predating frappe.db.advisory_lock, fall
++	# back to no gate rather than raising and marking the Repost Item Valuation permanently Failed.
++	if frappe.db.db_type == "postgres" and hasattr(frappe.db, "advisory_lock"):
++		# Tuple key: a colon in item_code/warehouse can't collide two distinct pairs onto one lock.
++		return frappe.db.advisory_lock(("stock_repost", item_code, warehouse), timeout=REPOST_LOCK_TIMEOUT)
++	return nullcontext()
++
++
++def sle_processing_gate(item_code, warehouse):
++	"""Serialize all stock writes for an (item, warehouse) on postgres. MariaDB gets this from the
++	gap locks its previous-SLE locking reads take (which also block, then reveal, concurrent
++	inserts); postgres locking reads never see rows another transaction is inserting, so without
++	this gate two concurrent writers compute from the same stale previous SLE and the loser's Bin
++	write is lost. Txn-scoped and re-entrant; released at commit/rollback. hasattr keeps a frappe
++	predating transaction_advisory_lock on the status quo (serialization-failure retries) instead
++	of breaking every stock submission."""
++	if frappe.db.db_type == "postgres" and hasattr(frappe.db, "transaction_advisory_lock"):
++		frappe.db.transaction_advisory_lock(("stock-sle", item_code, warehouse), timeout=REPOST_LOCK_TIMEOUT)
++
++
+ def repost_future_sle(
+ 	items_to_be_repost=None,
+ 	voucher_type=None,
+@@ -411,7 +445,16 @@ def get_items_to_be_repost(voucher_type=None, voucher_no=None, doc=None, reposti
+ 		items_to_be_repost = frappe.db.get_all(
+ 			"Stock Ledger Entry",
+ 			filters={"voucher_type": voucher_type, "voucher_no": voucher_no},
+-			fields=["item_code", "warehouse", "posting_date", "posting_time", "creation", "posting_datetime"],
++			fields=[
++				"item_code",
++				"warehouse",
++				# aggregate the non-grouped columns (earliest row per item+warehouse) so the GROUP BY
++				# is valid on Postgres; a single voucher's entries share posting_date/time per group
++				{"MIN": "posting_date", "as": "posting_date"},
++				{"MIN": "posting_time", "as": "posting_time"},
++				{"MIN": "creation", "as": "creation"},
++				{"MIN": "posting_datetime", "as": "posting_datetime"},
++			],
+ 			order_by="creation asc",
+ 			group_by="item_code, warehouse",
+ 		)
+@@ -1936,13 +1979,16 @@ def get_stock_ledger_entries(
+ 	if check_serial_no and previous_sle.get("serial_no"):
+ 		# conditions += " and serial_no like {}".format(frappe.db.escape('%{0}%'.format(previous_sle.get("serial_no"))))
+ 		serial_no = previous_sle.get("serial_no")
++		# lower() both sides so the match is case-insensitive on postgres too (MariaDB's collation
++		# already is); a no-op on MariaDB. The set is already narrowed by item_code/warehouse, so the
++		# functional comparison does not cost an index here.
+ 		conditions += (
+ 			""" and
+ 			(
+-				serial_no = {}
+-				or serial_no like {}
+-				or serial_no like {}
+-				or serial_no like {}
++				lower(serial_no) = lower({})
++				or lower(serial_no) like lower({})
++				or lower(serial_no) like lower({})
++				or lower(serial_no) like lower({})
+ 			)
+ 		"""
+ 		).format(
+@@ -2157,6 +2203,26 @@ def update_qty_in_future_sle(args, allow_negative_stock=False):
+ 	if next_stock_reco_detail:
+ 		query = query.where(get_datetime_limit_condition(sle, next_stock_reco_detail[0]))
+ 
++	new_qty = sle.qty_after_transaction + qty_shift
++
++	if get_valuation_method(args.get("item_code"), args.get("company")) == "Standard Cost":
++		# Standard Cost inventory is always carried at the standard rate, so a backdated entry only
++		# shifts future balances — no full repost is needed. Update qty and value in place:
++		# stock_value = qty_after_transaction * standard rate, which is constant across this range
++		# (a rate change posts a reconciliation that bounds it). stock_value_difference is unchanged
++		# because every future balance shifts by the same amount.
++		from erpnext.stock.doctype.item_standard_cost.item_standard_cost import get_item_standard_rate
++
++		standard_rate = flt(
++			get_item_standard_rate(args.get("item_code"), args.get("company"), args.get("posting_date"))
++		)
++
++		# Set stock_value before qty_after_transaction: MariaDB evaluates SET left-to-right with the
++		# already-updated values, so stock_value must be computed while qty still holds its pre-shift
++		# value. (Postgres uses pre-update values throughout, so the result is the same either way.)
++		query = query.set(sle.stock_value, new_qty * standard_rate)
++
++	query = query.set(sle.qty_after_transaction, new_qty)
+ 	query.run()
+ 
+ 	validate_negative_qty_in_future_sle(args, allow_negative_stock)
