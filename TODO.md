@@ -85,19 +85,28 @@ columns grouped by `work_order` — safe, all six are attributes of one WO
 document row per group, no correlation risk). Neither needed changes.
 (No `pick_list.py` fix exists in this patch set — nothing to check there.)
 
-## 3. Push to GitHub
+## 3. Push to GitHub [DONE 2026-08-29]
 
-Once 1 and 2 are resolved: create the `alfredoka/erpnext-postgres-compat-patch`
-repo (public, GPL-3.0 — matches ERPNext's license since this is a derivative
-work), push, verify the README renders correctly, and open the two upstream
-reports referenced from `mcp-frappe/CLAUDE.md`:
+Repo created (`alfredoka/erpnext-postgres-compat-patch`, public, GPL-3.0),
+pushed, README confirmed rendering fine.
 
-- FAC: recommend `order_by=None` at the `list_documents` count call site,
-  citing frappe/frappe#39790 as precedent (same bug, same one-line fix,
-  already merged and backported to two stable branches).
-- ERPNext: the `json = ''` failure from `patches/v15_0/backfill_sla_link_filters_*`
-  (Frappe's `("is", "not set")` filter translation doesn't handle JSON
-  columns on Postgres) — not fixed even on `develop`.
+Two upstream reports were considered, from `mcp-frappe/CLAUDE.md`:
+
+- FAC `list_documents` count-query bug: **no report needed** — already fixed
+  upstream. PR #246 (`fix: count query scalar error and order_by sentinel`,
+  same `order_by=None` fix, same precedent as frappe/frappe#39790) merged to
+  `develop` 2026-08-27, tracked by buildswithpaul/Frappe_Assistant_Core#189.
+  Not yet in a release tag (`v2.5.1` is from 2026-08-20, 7 commits behind
+  `develop`) — the local FAC patch on the server stays in place until infra
+  upgrades to a `develop` commit past `755c4b0`, but that's an infra/release
+  question, not a bug to report.
+- ERPNext `json = ''` failure in `patches/v15_0/backfill_sla_link_filters_*`:
+  reported as
+  [frappe/erpnext#58547](https://github.com/frappe/erpnext/issues/58547).
+  Confirmed via `frappe/core/doctype/docfield/docfield.json` that
+  `link_filters` is `fieldtype: JSON`, and confirmed the failure is in the
+  read-side filter — `frappe.db.set_value` is never reached, so no data
+  corruption, just a silently-incomplete backfill on Postgres.
 
 ## 4. Deploy the finished patch (blocked on 1–3)
 
