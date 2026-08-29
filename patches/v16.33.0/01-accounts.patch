@@ -550,7 +550,7 @@ index 6f90cb1..bf31018 100644
  	sales_data = (
  		frappe.qb.from_(parent)
 diff --git a/erpnext/accounts/report/purchase_register/purchase_register.py b/erpnext/accounts/report/purchase_register/purchase_register.py
-index a54e4df..df1c1ab 100644
+index a54e4df..a58d823 100644
 --- a/erpnext/accounts/report/purchase_register/purchase_register.py
 +++ b/erpnext/accounts/report/purchase_register/purchase_register.py
 @@ -5,7 +5,9 @@
@@ -594,6 +594,174 @@ index a54e4df..df1c1ab 100644
  		)
  
  		purchase_taxes_query = get_taxes_query(invoice_list, "Purchase Taxes and Charges", "Purchase Invoice")
+@@ -342,13 +352,18 @@ def get_account_columns(invoice_list, include_payments):
+ 			advance_tax_accounts = advance_taxes_query.run(as_dict=True, pluck="account_head")
+ 			tax_accounts = set(tax_accounts + advance_tax_accounts)
+ 
+-		unrealized_profit_loss_accounts = frappe.db.sql_list(
+-			"""SELECT distinct unrealized_profit_loss_account
+-			from `tabPurchase Invoice` where docstatus = 1 and name in (%s)
+-			and ifnull(unrealized_profit_loss_account, '') != ''
+-			order by unrealized_profit_loss_account"""
+-			% ", ".join(["%s"] * len(invoice_list)),
+-			tuple(inv.name for inv in invoice_list),
++		unrealized_profit_loss_accounts = sorted(
++			frappe.get_all(
++				"Purchase Invoice",
++				filters={
++					"docstatus": 1,
++					"name": ["in", [inv.name for inv in invoice_list]],
++					"unrealized_profit_loss_account": ["is", "set"],
++				},
++				pluck="unrealized_profit_loss_account",
++				distinct=True,
++			),
++			key=str.casefold,
+ 		)
+ 
+ 	for account in expense_accounts:
+@@ -471,16 +486,11 @@ def get_payments(filters):
+ 
+ 
+ def get_invoice_expense_map(invoice_list):
+-	expense_details = frappe.db.sql(
+-		"""
+-		select parent, expense_account, sum(base_net_amount) as amount
+-		from `tabPurchase Invoice Item`
+-		where parent in (%s) and parenttype='Purchase Invoice'
+-		group by parent, expense_account
+-	"""
+-		% ", ".join(["%s"] * len(invoice_list)),
+-		tuple(inv.name for inv in invoice_list),
+-		as_dict=1,
++	expense_details = frappe.get_all(
++		"Purchase Invoice Item",
++		filters={"parent": ["in", [inv.name for inv in invoice_list]], "parenttype": "Purchase Invoice"},
++		fields=["parent", "expense_account", {"SUM": "base_net_amount", "as": "amount"}],
++		group_by="parent, expense_account",
+ 	)
+ 
+ 	invoice_expense_map = {}
+@@ -492,13 +502,16 @@ def get_invoice_expense_map(invoice_list):
+ 
+ 
+ def get_internal_invoice_map(invoice_list):
+-	unrealized_amount_details = frappe.db.sql(
+-		"""SELECT name, unrealized_profit_loss_account,
+-		base_net_total as amount from `tabPurchase Invoice` where name in (%s)
+-		and is_internal_supplier = 1 and company = represents_company"""
+-		% ", ".join(["%s"] * len(invoice_list)),
+-		tuple(inv.name for inv in invoice_list),
+-		as_dict=1,
++	pi = frappe.qb.DocType("Purchase Invoice")
++	unrealized_amount_details = (
++		frappe.qb.from_(pi)
++		.select(pi.name, pi.unrealized_profit_loss_account, pi.base_net_total.as_("amount"))
++		.where(
++			pi.name.isin([inv.name for inv in invoice_list])
++			& (pi.is_internal_supplier == 1)
++			& (pi.company == pi.represents_company)
++		)
++		.run(as_dict=1)
+ 	)
+ 
+ 	internal_invoice_map = {}
+@@ -510,18 +523,23 @@ def get_internal_invoice_map(invoice_list):
+ 
+ 
+ def get_invoice_tax_map(invoice_list, invoice_expense_map, expense_accounts, include_payments=False):
+-	tax_details = frappe.db.sql(
+-		"""
+-		select parent, account_head, case add_deduct_tax when "Add" then sum(base_tax_amount_after_discount_amount)
+-		else sum(base_tax_amount_after_discount_amount) * -1 end as tax_amount
+-		from `tabPurchase Taxes and Charges`
+-		where parent in (%s) and category in ('Total', 'Valuation and Total')
+-			and base_tax_amount_after_discount_amount != 0 and parenttype='Purchase Invoice'
+-		group by parent, account_head, add_deduct_tax
+-	"""
+-		% ", ".join(["%s"] * len(invoice_list)),
+-		tuple(inv.name for inv in invoice_list),
+-		as_dict=1,
++	ptc = frappe.qb.DocType("Purchase Taxes and Charges")
++	tax_amount = (
++		Case()
++		.when(ptc.add_deduct_tax == "Add", Sum(ptc.base_tax_amount_after_discount_amount))
++		.else_(Sum(ptc.base_tax_amount_after_discount_amount) * -1)
++	)
++	tax_details = (
++		frappe.qb.from_(ptc)
++		.select(ptc.parent, ptc.account_head, tax_amount.as_("tax_amount"))
++		.where(
++			ptc.parent.isin([inv.name for inv in invoice_list])
++			& ptc.category.isin(["Total", "Valuation and Total"])
++			& (ptc.base_tax_amount_after_discount_amount != 0)
++			& (ptc.parenttype == "Purchase Invoice")
++		)
++		.groupby(ptc.parent, ptc.account_head, ptc.add_deduct_tax)
++		.run(as_dict=1)
+ 	)
+ 
+ 	if include_payments:
+@@ -535,22 +553,17 @@ def get_invoice_tax_map(invoice_list, invoice_expense_map, expense_accounts, inc
+ 			else:
+ 				invoice_expense_map[d.parent][d.account_head] = flt(d.tax_amount)
+ 		else:
+-			invoice_tax_map.setdefault(d.parent, frappe._dict()).setdefault(d.account_head, [])
+-			invoice_tax_map[d.parent][d.account_head] = flt(d.tax_amount)
++			invoice_tax_map.setdefault(d.parent, frappe._dict()).setdefault(d.account_head, 0.0)
++			invoice_tax_map[d.parent][d.account_head] += flt(d.tax_amount)
+ 
+ 	return invoice_expense_map, invoice_tax_map
+ 
+ 
+ def get_invoice_po_pr_map(invoice_list):
+-	pi_items = frappe.db.sql(
+-		"""
+-		select parent, purchase_order, purchase_receipt, po_detail, project
+-		from `tabPurchase Invoice Item`
+-		where parent in (%s) and parenttype='Purchase Invoice'
+-	"""
+-		% ", ".join(["%s"] * len(invoice_list)),
+-		tuple(inv.name for inv in invoice_list),
+-		as_dict=1,
++	pi_items = frappe.get_all(
++		"Purchase Invoice Item",
++		filters={"parent": ["in", [inv.name for inv in invoice_list]], "parenttype": "Purchase Invoice"},
++		fields=["parent", "purchase_order", "purchase_receipt", "po_detail", "project"],
+ 	)
+ 
+ 	invoice_po_pr_map = {}
+@@ -564,10 +577,11 @@ def get_invoice_po_pr_map(invoice_list):
+ 		if d.purchase_receipt:
+ 			pr_list = [d.purchase_receipt]
+ 		elif d.po_detail:
+-			pr_list = frappe.db.sql_list(
+-				"""select distinct parent from `tabPurchase Receipt Item`
+-				where docstatus=1 and purchase_order_item=%s""",
+-				d.po_detail,
++			pr_list = frappe.get_all(
++				"Purchase Receipt Item",
++				filters={"docstatus": 1, "purchase_order_item": d.po_detail},
++				pluck="parent",
++				distinct=True,
+ 			)
+ 
+ 		if pr_list:
+@@ -582,12 +596,8 @@ def get_invoice_po_pr_map(invoice_list):
+ def get_account_details(invoice_list):
+ 	account_map = {}
+ 	accounts = list(set([inv.credit_to for inv in invoice_list]))
+-	for acc in frappe.db.sql(
+-		"""select name, parent_account from tabAccount
+-		where name in (%s)"""
+-		% ", ".join(["%s"] * len(accounts)),
+-		tuple(accounts),
+-		as_dict=1,
++	for acc in frappe.get_all(
++		"Account", filters={"name": ["in", accounts]}, fields=["name", "parent_account"]
+ 	):
+ 		account_map[acc.name] = acc.parent_account
+ 
 diff --git a/erpnext/accounts/report/sales_register/sales_register.py b/erpnext/accounts/report/sales_register/sales_register.py
 index d789bcd..01691d0 100644
 --- a/erpnext/accounts/report/sales_register/sales_register.py
@@ -624,7 +792,7 @@ index d789bcd..01691d0 100644
  
  		sales_taxes_query = get_taxes_query(invoice_list, "Sales Taxes and Charges", "Sales Invoice")
 diff --git a/erpnext/accounts/report/trial_balance/trial_balance.py b/erpnext/accounts/report/trial_balance/trial_balance.py
-index 8fb564a..4d8cd6e 100644
+index 8fb564a..15862f5 100644
 --- a/erpnext/accounts/report/trial_balance/trial_balance.py
 +++ b/erpnext/accounts/report/trial_balance/trial_balance.py
 @@ -4,7 +4,7 @@
@@ -636,7 +804,35 @@ index 8fb564a..4d8cd6e 100644
  from frappe.utils import add_days, cstr, flt, formatdate, getdate
  
  import erpnext
-@@ -240,7 +240,8 @@ def get_opening_balance(
+@@ -82,12 +82,21 @@ def validate_filters(filters):
+ 
+ 
+ def get_data(filters):
+-	accounts = frappe.db.sql(
+-		"""select name, account_number, parent_account, account_name, root_type, report_type, is_group, lft, rgt
+-
+-		from `tabAccount` where company=%s order by lft""",
+-		filters.company,
+-		as_dict=True,
++	accounts = frappe.get_all(
++		"Account",
++		filters={"company": filters.company},
++		fields=[
++			"name",
++			"account_number",
++			"parent_account",
++			"account_name",
++			"root_type",
++			"report_type",
++			"is_group",
++			"lft",
++			"rgt",
++		],
++		order_by="lft",
+ 	)
+ 	company_currency = filters.presentation_currency or erpnext.get_company_currency(filters.company)
+ 
+@@ -240,7 +249,8 @@ def get_opening_balance(
  		frappe.qb.from_(closing_balance)
  		.select(
  			closing_balance.account,
@@ -646,6 +842,33 @@ index 8fb564a..4d8cd6e 100644
  			Sum(closing_balance.debit).as_("debit"),
  			Sum(closing_balance.credit).as_("credit"),
  			Sum(closing_balance.debit_in_account_currency).as_("debit_in_account_currency"),
+@@ -587,11 +597,21 @@ def execute_snapshot_report(filters):
+ 
+ def get_data_duckdb(filters, conn):
+ 	# accounts and all metadata via frappe.db — only GL Entry comes from DuckDB
+-	accounts = frappe.db.sql(
+-		"""select name, account_number, parent_account, account_name, root_type, report_type, is_group, lft, rgt
+-		from `tabAccount` where company=%s order by lft""",
+-		filters.company,
+-		as_dict=True,
++	accounts = frappe.get_all(
++		"Account",
++		filters={"company": filters.company},
++		fields=[
++			"name",
++			"account_number",
++			"parent_account",
++			"account_name",
++			"root_type",
++			"report_type",
++			"is_group",
++			"lft",
++			"rgt",
++		],
++		order_by="lft",
+ 	)
+ 	if not accounts:
+ 		return None
 diff --git a/erpnext/accounts/report/voucher_wise_balance/voucher_wise_balance.py b/erpnext/accounts/report/voucher_wise_balance/voucher_wise_balance.py
 index 1918165..e02a898 100644
 --- a/erpnext/accounts/report/voucher_wise_balance/voucher_wise_balance.py
@@ -896,3 +1119,268 @@ index c5feb86..64e49a1 100644
  				)
  			)
  
+diff --git a/erpnext/accounts/report/item_wise_purchase_register/item_wise_purchase_register.py b/erpnext/accounts/report/item_wise_purchase_register/item_wise_purchase_register.py
+index 0f0121f..4bb252d 100644
+--- a/erpnext/accounts/report/item_wise_purchase_register/item_wise_purchase_register.py
++++ b/erpnext/accounts/report/item_wise_purchase_register/item_wise_purchase_register.py
+@@ -376,7 +376,7 @@ def get_items(filters, additional_table_columns):
+ 
+ 
+ def get_aii_accounts():
+-	return dict(frappe.db.sql("select name, stock_received_but_not_billed from tabCompany"))
++	return dict(frappe.get_all("Company", fields=["name", "stock_received_but_not_billed"], as_list=True))
+ 
+ 
+ def get_purchase_receipts_against_purchase_order(item_list):
+@@ -384,16 +384,11 @@ def get_purchase_receipts_against_purchase_order(item_list):
+ 	po_item_rows = list(set(d.po_detail for d in item_list))
+ 
+ 	if po_item_rows:
+-		purchase_receipts = frappe.db.sql(
+-			"""
+-			select parent, purchase_order_item
+-			from `tabPurchase Receipt Item`
+-			where docstatus=1 and purchase_order_item in (%s)
+-			group by purchase_order_item, parent
+-		"""
+-			% (", ".join(["%s"] * len(po_item_rows))),
+-			tuple(po_item_rows),
+-			as_dict=1,
++		purchase_receipts = frappe.get_all(
++			"Purchase Receipt Item",
++			filters={"docstatus": 1, "purchase_order_item": ["in", po_item_rows]},
++			fields=["parent", "purchase_order_item"],
++			group_by="purchase_order_item, parent",
+ 		)
+ 
+ 		for pr in purchase_receipts:
+diff --git a/erpnext/accounts/report/sales_payment_summary/sales_payment_summary.py b/erpnext/accounts/report/sales_payment_summary/sales_payment_summary.py
+index 7c2bf7e..470bd56 100644
+--- a/erpnext/accounts/report/sales_payment_summary/sales_payment_summary.py
++++ b/erpnext/accounts/report/sales_payment_summary/sales_payment_summary.py
+@@ -3,6 +3,7 @@
+ 
+ import frappe
+ from frappe import _
++from frappe.query_builder.functions import Coalesce, Max, Min, Sum
+ from frappe.utils import cstr
+ 
+ 
+@@ -100,78 +101,140 @@ def get_sales_payment_data(filters, columns):
+ 	return data
+ 
+ 
+-def get_conditions(filters):
+-	conditions = "1=1"
++def apply_conditions(query, a, filters):
++	"""Apply the same filters get_conditions() used to build, as parameterized qb .where() clauses.
++
++	`a` is the field source for the Sales Invoice columns -- either the `tabSales Invoice`
++	DocType or a subquery aliased `a` that selects those columns. This mirrors the previous
++	raw SQL where every predicate was keyed on the `a` alias.
++	"""
+ 	if filters.get("from_date"):
+-		conditions += " and a.posting_date >= %(from_date)s"
++		query = query.where(a.posting_date >= filters.get("from_date"))
+ 	if filters.get("to_date"):
+-		conditions += " and a.posting_date <= %(to_date)s"
++		query = query.where(a.posting_date <= filters.get("to_date"))
+ 	if filters.get("company"):
+-		conditions += " and a.company=%(company)s"
++		query = query.where(a.company == filters.get("company"))
+ 	if filters.get("customer"):
+-		conditions += " and a.customer = %(customer)s"
++		query = query.where(a.customer == filters.get("customer"))
+ 	if filters.get("owner"):
+-		conditions += " and a.owner = %(owner)s"
++		query = query.where(a.owner == filters.get("owner"))
+ 	if filters.get("is_pos"):
+-		conditions += " and a.is_pos = %(is_pos)s"
+-	return conditions
++		query = query.where(a.is_pos == filters.get("is_pos"))
++	return query
+ 
+ 
+ def get_pos_invoice_data(filters):
+-	conditions = get_conditions(filters)
+-	result = frappe.db.sql(
+-		""
+-		"SELECT "
+-		'posting_date, owner, sum(net_total) as "net_total", sum(total_taxes) as "total_taxes", '
+-		'sum(paid_amount) as "paid_amount", sum(outstanding_amount) as "outstanding_amount", '
+-		"mode_of_payment, warehouse, cost_center "
+-		"FROM ("
+-		"SELECT "
+-		'parent, item_code, sum(amount) as "base_total", warehouse, cost_center '
+-		"from `tabSales Invoice Item`  group by parent"
+-		") t1 "
+-		"left join "
+-		"(select parent, mode_of_payment from `tabSales Invoice Payment` group by parent) t3 "
+-		"on (t3.parent = t1.parent) "
+-		"JOIN ("
+-		"SELECT "
+-		'docstatus, company, is_pos, name, posting_date, owner, sum(base_total) as "base_total", '
+-		'sum(net_total) as "net_total", sum(total_taxes_and_charges) as "total_taxes", '
+-		'sum(base_paid_amount) as "paid_amount", sum(outstanding_amount) as "outstanding_amount" '
+-		"FROM `tabSales Invoice` "
+-		"GROUP BY name"
+-		") a "
+-		"ON ("
+-		"t1.parent = a.name and t1.base_total = a.base_total) "
+-		"WHERE a.docstatus = 1"
+-		f" AND {conditions} "
+-		"GROUP BY "
+-		"owner, posting_date, warehouse",
+-		filters,
+-		as_dict=1,
++	sii = frappe.qb.DocType("Sales Invoice Item")
++	sip = frappe.qb.DocType("Sales Invoice Payment")
++	si = frappe.qb.DocType("Sales Invoice")
++
++	# t1: one row per invoice with the summed item base_total. warehouse and cost_center describe an
++	# item line, not the invoice, and an invoice may carry several. warehouse then becomes an outer
++	# grouping key below, so which line wins decides how rows are partitioned and what each row totals
++	# -- not merely which label is shown. Max() over text is a sort, and MariaDB (case-folding) and
++	# PostgreSQL (byte order) resolve it differently, so take both off one real line instead.
++	# The representative is the first line the user entered: Min(idx) is an integer, so the pick is
++	# free of collation and is meaningful, rather than turning on an unrelated hash-named row.
++	grouped_items = (
++		frappe.qb.from_(sii)
++		.select(sii.parent, Sum(sii.amount).as_("base_total"), Min(sii.idx).as_("representative_idx"))
++		.groupby(sii.parent)
++	).as_("grouped_items")
++	representative_item = frappe.qb.DocType("Sales Invoice Item").as_("representative_item")
++	t1 = (
++		frappe.qb.from_(grouped_items)
++		.inner_join(representative_item)
++		.on(
++			(representative_item.parent == grouped_items.parent)
++			& (representative_item.idx == grouped_items.representative_idx)
++		)
++		.select(
++			grouped_items.parent,
++			grouped_items.base_total,
++			representative_item.warehouse,
++			representative_item.cost_center,
++		)
++	)
++
++	# t3: mode_of_payment per invoice, from one real payment line for the same reason
++	grouped_payments = (
++		frappe.qb.from_(sip).select(sip.parent, Min(sip.idx).as_("representative_idx")).groupby(sip.parent)
++	).as_("grouped_payments")
++	representative_payment = frappe.qb.DocType("Sales Invoice Payment").as_("representative_payment")
++	t3 = (
++		frappe.qb.from_(grouped_payments)
++		.inner_join(representative_payment)
++		.on(
++			(representative_payment.parent == grouped_payments.parent)
++			& (representative_payment.idx == grouped_payments.representative_idx)
++		)
++		.select(grouped_payments.parent, representative_payment.mode_of_payment.as_("mode_of_payment"))
++	)
++
++	# a: invoice-level aggregates. Grouped by the primary key (si.name), so the other plain si columns
++	# (incl. customer, needed by the customer filter) are functionally dependent and valid on Postgres.
++	a = (
++		frappe.qb.from_(si)
++		.select(
++			si.docstatus,
++			si.company,
++			si.customer,
++			si.is_pos,
++			si.name,
++			si.posting_date,
++			si.owner,
++			Sum(si.base_total).as_("base_total"),
++			Sum(si.net_total).as_("net_total"),
++			Sum(si.total_taxes_and_charges).as_("total_taxes"),
++			Sum(si.base_paid_amount).as_("paid_amount"),
++			Sum(si.outstanding_amount).as_("outstanding_amount"),
++		)
++		.groupby(si.name)
++	)
++
++	query = (
++		frappe.qb.from_(t1)
++		.left_join(t3)
++		.on(t3.parent == t1.parent)
++		.join(a)
++		.on((t1.parent == a.name) & (t1.base_total == a.base_total))
++		.select(
++			a.posting_date,
++			a.owner,
++			Sum(a.net_total).as_("net_total"),
++			Sum(a.total_taxes).as_("total_taxes"),
++			Sum(a.paid_amount).as_("paid_amount"),
++			Sum(a.outstanding_amount).as_("outstanding_amount"),
++			# mode_of_payment/cost_center are not in the outer GROUP BY -> Max() (deterministic, both engines)
++			Max(t3.mode_of_payment).as_("mode_of_payment"),
++			t1.warehouse,
++			Max(t1.cost_center).as_("cost_center"),
++		)
++		.where(a.docstatus == 1)
++		.groupby(a.owner, a.posting_date, t1.warehouse)
+ 	)
+-	return result
++	query = apply_conditions(query, a, filters)
++
++	return query.run(as_dict=True)
+ 
+ 
+ def get_sales_invoice_data(filters):
+-	conditions = get_conditions(filters)
+-	return frappe.db.sql(
+-		f"""
+-		select
+-			a.posting_date, a.owner,
+-			sum(a.net_total) as "net_total",
+-			sum(a.total_taxes_and_charges) as "total_taxes",
+-			sum(a.base_paid_amount) as "paid_amount",
+-			sum(a.outstanding_amount) as "outstanding_amount"
+-		from `tabSales Invoice` a
+-		where a.docstatus = 1
+-			and {conditions}
+-			group by
+-			a.owner, a.posting_date
+-	""",
+-		filters,
+-		as_dict=1,
++	a = frappe.qb.DocType("Sales Invoice")
++	query = (
++		frappe.qb.from_(a)
++		.select(
++			a.posting_date,
++			a.owner,
++			Sum(a.net_total).as_("net_total"),
++			Sum(a.total_taxes_and_charges).as_("total_taxes"),
++			Sum(a.base_paid_amount).as_("paid_amount"),
++			Sum(a.outstanding_amount).as_("outstanding_amount"),
++		)
++		.where(a.docstatus == 1)
++		.groupby(a.owner, a.posting_date)
+ 	)
++	query = apply_conditions(query, a, filters)
++	return query.run(as_dict=True)
+ 
+ 
+ def get_mode_of_payments(filters):
+@@ -209,14 +272,10 @@ def get_mode_of_payments(filters):
+ 
+ 
+ def get_invoices(filters):
+-	conditions = get_conditions(filters)
+-	return frappe.db.sql(
+-		f"""select a.name
+-		from `tabSales Invoice` a
+-		where a.docstatus = 1 and {conditions}""",
+-		filters,
+-		as_dict=1,
+-	)
++	a = frappe.qb.DocType("Sales Invoice")
++	query = frappe.qb.from_(a).select(a.name).where(a.docstatus == 1)
++	query = apply_conditions(query, a, filters)
++	return query.run(as_dict=True)
+ 
+ 
+ def get_mode_of_payment_details(filters):

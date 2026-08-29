@@ -1,8 +1,8 @@
 diff --git a/erpnext/manufacturing/doctype/bom/bom.py b/erpnext/manufacturing/doctype/bom/bom.py
-index d90c57b..8909b18 100644
+index d90c57b..5f2e888 100644
 --- a/erpnext/manufacturing/doctype/bom/bom.py
 +++ b/erpnext/manufacturing/doctype/bom/bom.py
-@@ -1418,19 +1418,24 @@ def get_bom_items_as_dict(
+@@ -1418,19 +1418,33 @@ def get_bom_items_as_dict(
  		group_by_cond = "group by item_code"
  
  	# Did not use qty_consumed_per_unit in the query, as it leads to rounding loss
@@ -11,6 +11,15 @@ index d90c57b..8909b18 100644
 +	# Each keeps an explicit alias because the query runs with as_dict=True and the caller reads
 +	# these keys. Wrapping a column that IS grouped is a no-op: it is constant within the group.
 +	# ifnull() is MariaDB-only; coalesce() is standard and behaves identically on both engines.
++	#
++	# is_phantom_item and bom_no are the one pair below that must NOT get this treatment: the loop
++	# below recurses into bom_no whenever is_phantom_item is set, so an independent max() per column
++	# could pair one line's phantom flag with a different line's bom_no and explode the wrong
++	# sub-BOM -- a combination that never existed in any single row. Upstream (develop) avoids this
++	# by grouping by the (bom_no, is_phantom_item) pair itself instead of aggregating it away, so
++	# each group's row is guaranteed to carry a bom_no/is_phantom_item pair that actually co-occurred
++	# on some real BOM Item line. That extra group-by column only affects the "else" branch below
++	# (BOM Item, non-exploded, non-secondary), the only branch that selects is_phantom_item/bom_no.
  	query = """select
  				bom_item.item_code,
 -				bom_item.idx,
@@ -38,7 +47,7 @@ index d90c57b..8909b18 100644
  				{select_columns}
  			from
  				`tab{table}` bom_item
-@@ -1444,7 +1449,7 @@ def get_bom_items_as_dict(
+@@ -1444,7 +1458,7 @@ def get_bom_items_as_dict(
  				and (item.is_stock_item in (1, {is_stock_item})
  				{where_conditions}
  				{group_by_cond}
@@ -47,7 +56,7 @@ index d90c57b..8909b18 100644
  
  	is_stock_item = cint(not include_non_stock_items)
  	if cint(fetch_exploded):
-@@ -1454,9 +1459,10 @@ def get_bom_items_as_dict(
+@@ -1454,9 +1468,10 @@ def get_bom_items_as_dict(
  			is_stock_item=is_stock_item,
  			qty_field="stock_qty",
  			group_by_cond=group_by_cond,
@@ -61,7 +70,7 @@ index d90c57b..8909b18 100644
  				(Select idx from `tabBOM Item` where item_code = bom_item.item_code and parent = %(parent)s limit 1) as idx""",
  		)
  
-@@ -1467,7 +1473,7 @@ def get_bom_items_as_dict(
+@@ -1467,7 +1482,7 @@ def get_bom_items_as_dict(
  		query = query.format(
  			table="BOM Secondary Item",
  			where_conditions=")",
@@ -70,7 +79,7 @@ index d90c57b..8909b18 100644
  			is_stock_item=is_stock_item,
  			qty_field="stock_qty",
  			group_by_cond=group_by_cond,
-@@ -1480,10 +1486,13 @@ def get_bom_items_as_dict(
+@@ -1480,11 +1495,17 @@ def get_bom_items_as_dict(
  			where_conditions="or bom_item.is_phantom_item)",
  			is_stock_item=is_stock_item,
  			qty_field="stock_qty" if fetch_qty_in_stock_uom else "qty",
@@ -78,16 +87,21 @@ index d90c57b..8909b18 100644
 -				bom_item.operation, bom_item.include_item_in_manufacturing, bom_item.sourced_by_supplier,
 -				sum(bom_item.stock_qty/ifnull(bom.quantity, 1)) * bom_item.rate * %(qty)s as amount,
 -				bom_item.description, bom_item.base_rate as rate, bom_item.operation_row_id, bom_item.is_phantom_item , bom_item.bom_no """,
+-			group_by_cond=group_by_cond,
 +			select_columns=""", max(bom_item.rate) as rate, max(bom_item.uom) as uom, max(bom_item.conversion_factor) as conversion_factor,
 +				max(bom_item.source_warehouse) as source_warehouse,
 +				max(bom_item.operation) as operation, max(bom_item.include_item_in_manufacturing) as include_item_in_manufacturing,
 +				max(bom_item.sourced_by_supplier) as sourced_by_supplier,
 +				sum(bom_item.stock_qty/coalesce(bom.quantity, 1)) * max(bom_item.rate) * %(qty)s as amount,
 +				max(bom_item.description) as description, max(bom_item.base_rate) as rate, max(bom_item.operation_row_id) as operation_row_id,
-+				max(bom_item.is_phantom_item) as is_phantom_item , max(bom_item.bom_no) as bom_no """,
- 			group_by_cond=group_by_cond,
++				bom_item.is_phantom_item, bom_item.bom_no """,
++			# grouping by the (bom_no, is_phantom_item) pair itself (instead of max()-ing each
++			# independently) guarantees every returned row's pair actually co-occurred on some real
++			# BOM Item line -- see the note above get_bom_items_as_dict's query template.
++			group_by_cond=group_by_cond + ", bom_item.bom_no, bom_item.is_phantom_item",
  		)
  		items = frappe.db.sql(query, {"qty": qty, "bom": bom, "company": company}, as_dict=True)
+ 
 diff --git a/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py b/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
 index 5957812..53decb2 100644
 --- a/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
