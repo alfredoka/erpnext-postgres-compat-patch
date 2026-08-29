@@ -108,10 +108,27 @@ Two upstream reports were considered, from `mcp-frappe/CLAUDE.md`:
   read-side filter — `frappe.db.set_value` is never reached, so no data
   corruption, just a silently-incomplete backfill on Postgres.
 
-## 4. Deploy the finished patch (blocked on 1–3)
+## 4. Deploy the finished patch [DONE 2026-08-29]
 
-Once the patch set is complete and verified: refresh the
-the build's Dockerfile ConfigMap, add `COPY`+`git apply`
-steps to the Dockerfile, rebuild, and roll out. No `bench migrate` needed —
-source-level changes only. **Do not do this until explicitly asked** — infra
-changes are on hold until this repo is finished and reviewed.
+Deployed to production (`moca.cuantic.com`) via a build-time `git clone` +
+`apply.sh` step in the infra repo's Dockerfile, pinned to a commit SHA.
+Image `v16.33.0-3` rolled out across all 6 deployments; verified live —
+Trial Balance, Balance Sheet, P&L, and Cash Flow all run clean against the
+production Postgres DB.
+
+One real bug surfaced only after the first deploy attempt (`v16.33.0-2`):
+`erpnext/accounts/report/financial_statements.py`'s `get_accounting_entries`
+— a shared helper behind all four of those reports — was missed by **both**
+the original comment-based discovery and the 2026-08-29 `audit_groupby.py`
+re-audit (item 1 above). It had two separate Postgres breaks: a
+`force_index("posting_date_company_index")` call (MariaDB-only index hint,
+straight syntax error on Postgres) that was *masking* the same
+GROUP-BY-without-aggregation bug underneath it. Fixed by matching
+`develop`'s exact technique (guard the `force_index` call on `db_type`,
+wrap `account_currency`/`posting_date`/`is_opening`/`fiscal_year` in `Max()`
+when grouping by account) and hot-tested directly in the running pod before
+committing to a full rebuild — confirmed working, then shipped as
+`v16.33.0-3`. Lesson for any future re-audit: `audit_groupby.py` only
+catches `GROUP BY`-shaped problems; a shared helper with a *different* kind
+of MariaDB-only SQL (index hints, in this case) needs a live smoke test of
+each affected report, not just a static audit, to catch reliably.
