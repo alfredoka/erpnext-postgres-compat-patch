@@ -50,15 +50,15 @@ closed as *not planned*.
 
 ## What is fixed
 
-39 files, 122 hunks, grouped by module so a single failing hunk after a future
+43 files, 147 hunks, grouped by module so a single failing hunk after a future
 upgrade tells you exactly what broke:
 
 | Patch | Files | Hunks |
 |---|---|---|
-| `01-accounts.patch` | 15 | 45 |
-| `02-buying.patch` | 2 | 5 |
+| `01-accounts.patch` | 18 | 62 |
+| `02-buying.patch` | 3 | 8 |
 | `03-selling.patch` | 4 | 11 |
-| `04-stock.patch` | 13 | 46 |
+| `04-stock.patch` | 13 | 51 |
 | `05-manufacturing.patch` | 3 | 10 |
 | `06-erpnext_integrations.patch` | 1 | 3 |
 | `07-www.patch` | 1 | 2 |
@@ -82,6 +82,9 @@ The changes cover several distinct MariaDB-vs-PostgreSQL differences:
   `Min()`, which preserves the original ordering where the column is unique.
 - **MariaDB-only SQL** — `DATEDIFF`, `TO_SECONDS`, `MONTHNAME`, `IF()`,
   `IFNULL()`, `GROUP_CONCAT`, `UNSIGNED` casts, `CURRENT_DATE()` as a call.
+- **MariaDB-only index hints** — `FORCE INDEX (...)`, which PostgreSQL has no
+  equivalent for (its planner picks the index on its own); guarded on
+  `frappe.db.db_type` and dropped entirely on PostgreSQL.
 - **Collation-dependent ordering** — explicit `casefold` sorting so column order
   is identical on both backends.
 
@@ -138,12 +141,14 @@ cd $BENCH/apps/erpnext
 /path/to/erpnext-postgres-compat-patch/apply.sh
 ```
 
-In a Docker build:
+In a Docker build, pin to a commit rather than a branch so rebuilds stay
+reproducible — this repo has no tags, and `master` moves:
 
 ```dockerfile
-RUN git clone --depth 1 --branch v16.33.0-1 \
-      https://github.com/alfredoka/erpnext-postgres-compat-patch /tmp/pgpatch && \
-    cd apps/erpnext && /tmp/pgpatch/apply.sh
+RUN git clone --quiet https://github.com/alfredoka/erpnext-postgres-compat-patch.git /tmp/pgpatch && \
+    git -C /tmp/pgpatch checkout --quiet <commit-sha> && \
+    cd apps/erpnext && /tmp/pgpatch/apply.sh v16.33.0 && \
+    cd - && rm -rf /tmp/pgpatch
 ```
 
 `apply.sh` uses `git apply`, so it fails loudly if a hunk no longer applies —
@@ -159,7 +164,7 @@ checking that:
 
 - all 7 patches apply with no fuzz, and the result is byte-identical to the
   curated tree;
-- all 39 files compile;
+- all 43 files compile;
 - no new undefined names appear versus unpatched v16.33.0
   (`tools/check_undefined_names.py`);
 - no `SELECT` column remains ungrouped and unaggregated
@@ -169,13 +174,20 @@ checking that:
 `tools/audit_groupby.py` pairs each `.select()` with the `.groupby()` of its own
 query-builder chain, and knows the two rules that otherwise drown the output in
 false positives: primary-key functional dependency, and aggregates bound to a
-variable on an earlier line. It has one known blind spot — a `GROUP BY` built
-from an interpolated variable in raw SQL, as `bom.py` does — so raw SQL still
-needs reading.
+variable on an earlier line. It has two known blind spots: a `GROUP BY` built
+from an interpolated variable in raw SQL, as `bom.py` does, so raw SQL still
+needs reading; and any MariaDB-only SQL that isn't `GROUP BY`-shaped at all —
+`FORCE INDEX (...)` in `financial_statements.py` slipped past every static
+check this way, since it's a syntax error, not an aggregation mismatch, and
+was only caught by exercising the actual report against Postgres.
 
-Static checks cannot prove the SQL is correct, only that it is plausible. The
-hand-written fixes in particular have not been exercised against a populated
-database.
+Static checks alone cannot prove the SQL is correct, only that it is
+plausible — this patch set has also been exercised against a populated
+production Postgres database (all four financial-statement-family reports:
+Trial Balance, Balance Sheet, Profit and Loss, Cash Flow), which is what
+caught the `financial_statements.py` gap above. That is real-world
+verification on one deployment's data shape, though, not a substitute for a
+proper test suite against a range of data.
 
 ## Provenance and license
 
