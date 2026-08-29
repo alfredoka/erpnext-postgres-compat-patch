@@ -1,7 +1,16 @@
 diff --git a/erpnext/stock/deprecated_serial_batch.py b/erpnext/stock/deprecated_serial_batch.py
-index 77d6918..9e87e40 100644
+index 77d6918..7e60d24 100644
 --- a/erpnext/stock/deprecated_serial_batch.py
 +++ b/erpnext/stock/deprecated_serial_batch.py
+@@ -4,7 +4,7 @@ from collections import defaultdict
+ 
+ import frappe
+ from frappe.query_builder.functions import Sum
+-from frappe.utils import flt, nowtime
++from frappe.utils import flt
+ from pypika import Order
+ from pypika.functions import Coalesce
+ 
 @@ -135,6 +135,23 @@ class DeprecatedBatchNoValuation:
  					sle.creation < self.sle.creation
  				)
@@ -119,19 +128,21 @@ index 77d6918..9e87e40 100644
  		for d in batch_data:
  			self.available_qty[d.batch_no] += flt(d.batch_qty)
 diff --git a/erpnext/stock/doctype/pick_list/pick_list.py b/erpnext/stock/doctype/pick_list/pick_list.py
-index 5fd8f33..531e4e6 100644
+index 5fd8f33..d23cab6 100644
 --- a/erpnext/stock/doctype/pick_list/pick_list.py
 +++ b/erpnext/stock/doctype/pick_list/pick_list.py
-@@ -9,8 +9,7 @@ import frappe
+@@ -9,9 +9,8 @@ import frappe
  from frappe import _, bold
  from frappe.model.mapper import map_child_doc
  from frappe.query_builder import Case
 -from frappe.query_builder.custom import GROUP_CONCAT
 -from frappe.query_builder.functions import Coalesce, Locate, Replace, Sum
+-from frappe.utils import ceil, cint, floor, flt, get_link_to_form
 +from frappe.query_builder.functions import Coalesce, GroupConcat, Locate, Max, Replace, Sum
- from frappe.utils import ceil, cint, floor, flt, get_link_to_form
++from frappe.utils import cint, floor, flt, get_link_to_form
  from frappe.utils.nestedset import get_descendants_of
  
+ from erpnext.selling.doctype.sales_order.sales_order import (
 @@ -1859,6 +1858,9 @@ def get_pick_list_query(doctype, txt, searchfield, start, page_len, filters):
  	PICK_LIST_ITEM = frappe.qb.DocType("Pick List Item")
  	SALES_ORDER = frappe.qb.DocType("Sales Order")
@@ -157,20 +168,18 @@ index 5fd8f33..531e4e6 100644
  		.where(PICK_LIST.docstatus == 1)
  		.where(PICK_LIST.status.isin(["Open", "Partly Delivered"]))
 diff --git a/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py b/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py
-index fc19b46..66e239a 100644
+index fc19b46..0cdfae7 100644
 --- a/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py
 +++ b/erpnext/stock/doctype/serial_and_batch_bundle/serial_and_batch_bundle.py
-@@ -2,16 +2,16 @@
+@@ -2,7 +2,6 @@
  # For license information, please see license.txt
  
  import collections
 -import csv
  import json
  from collections import Counter, defaultdict
-+from typing import Any
  
- import frappe
- import frappe.query_builder
+@@ -11,7 +10,7 @@ import frappe.query_builder
  from frappe import _, _dict, bold
  from frappe.model.document import Document
  from frappe.model.naming import make_autoname
@@ -179,7 +188,7 @@ index fc19b46..66e239a 100644
  from frappe.utils import (
  	cint,
  	cstr,
-@@ -1883,8 +1883,29 @@ class SerialandBatchBundle(Document):
+@@ -1883,8 +1882,29 @@ class SerialandBatchBundle(Document):
  		self.set("entries", [])
  
  
@@ -210,7 +219,7 @@ index fc19b46..66e239a 100644
  	csv_data = []
  	if isinstance(content, str):
  		content = parse_json(content)
-@@ -3196,7 +3217,7 @@ def get_available_batches(kwargs):
+@@ -3196,7 +3216,7 @@ def get_available_batches(kwargs):
  			batch_ledger.batch_no,
  			batch_ledger.warehouse,
  			Sum(batch_ledger.qty).as_("qty"),
@@ -219,7 +228,7 @@ index fc19b46..66e239a 100644
  		)
  		.where(batch_table.disabled == 0)
  		.where(stock_ledger_entry.is_cancelled == 0)
-@@ -3236,12 +3257,13 @@ def get_available_batches(kwargs):
+@@ -3236,12 +3256,13 @@ def get_available_batches(kwargs):
  		else:
  			query = query.where(batch_ledger.batch_no == kwargs.batch_no)
  
@@ -236,7 +245,7 @@ index fc19b46..66e239a 100644
  
  	if kwargs.get("ignore_voucher_nos"):
  		query = query.where(stock_ledger_entry.voucher_no.notin(kwargs.get("ignore_voucher_nos")))
-@@ -3458,6 +3480,10 @@ def get_stock_ledgers_for_serial_nos(kwargs):
+@@ -3458,6 +3479,10 @@ def get_stock_ledgers_for_serial_nos(kwargs):
  			stock_ledger_entry.actual_qty,
  			stock_ledger_entry.serial_no,
  			stock_ledger_entry.serial_and_batch_bundle,
@@ -247,7 +256,7 @@ index fc19b46..66e239a 100644
  		)
  		.where(stock_ledger_entry.is_cancelled == 0)
  		.orderby(stock_ledger_entry.posting_datetime)
-@@ -3524,10 +3550,10 @@ def get_stock_ledgers_batches(kwargs):
+@@ -3524,10 +3549,10 @@ def get_stock_ledgers_batches(kwargs):
  		.on(stock_ledger_entry.batch_no == batch_table.name)
  		.select(
  			stock_ledger_entry.warehouse,
@@ -260,7 +269,7 @@ index fc19b46..66e239a 100644
  		)
  		.where((stock_ledger_entry.is_cancelled == 0) & (stock_ledger_entry.batch_no.isnotnull()))
  		.groupby(stock_ledger_entry.batch_no, stock_ledger_entry.warehouse)
-@@ -3563,12 +3589,13 @@ def get_stock_ledgers_batches(kwargs):
+@@ -3563,12 +3588,13 @@ def get_stock_ledgers_batches(kwargs):
  	if kwargs.get("ignore_voucher_nos"):
  		query = query.where(stock_ledger_entry.voucher_no.notin(kwargs.get("ignore_voucher_nos")))
  
@@ -278,10 +287,10 @@ index fc19b46..66e239a 100644
  	data = query.run(as_dict=True)
  	batches = {}
 diff --git a/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py b/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py
-index 4f6919e..6b77c5b 100644
+index 4f6919e..38ea008 100644
 --- a/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py
 +++ b/erpnext/stock/doctype/stock_ledger_entry/stock_ledger_entry.py
-@@ -2,20 +2,21 @@
+@@ -2,20 +2,20 @@
  # License: GNU General Public License v3. See license.txt
  
  
@@ -294,20 +303,18 @@ index 4f6919e..6b77c5b 100644
  from frappe.core.doctype.role.role import get_users
  from frappe.model.document import Document
 -from frappe.query_builder.functions import Sum
-+from frappe.query_builder.functions import Concat_ws, Max, Sum
++from frappe.query_builder.functions import Max, Sum
  from frappe.utils import add_days, cint, flt, formatdate, get_datetime, getdate
  
  from erpnext.accounts.utils import get_fiscal_year
  from erpnext.controllers.item_variant import ItemTemplateCannotHaveStock
  from erpnext.stock.doctype.inventory_dimension.inventory_dimension import get_inventory_dimensions
--from erpnext.stock.serial_batch_bundle import SerialBatchBundle
+ from erpnext.stock.serial_batch_bundle import SerialBatchBundle
 -from erpnext.stock.stock_ledger import get_previous_sle
-+from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos as get_parsed_serial_nos
-+from erpnext.stock.serial_batch_bundle import SerialBatchBundle, get_serial_nos
  
  
  class StockFreezeError(frappe.ValidationError):
-@@ -312,13 +313,17 @@ class StockLedgerEntry(Document):
+@@ -312,13 +312,17 @@ class StockLedgerEntry(Document):
  		if authorized_role:
  			authorized_users = get_users(authorized_role)
  			if authorized_users and frappe.session.user not in authorized_users:
@@ -332,7 +339,7 @@ index 4f6919e..6b77c5b 100644
  				)[0][0]
  
  				cur_doc_posting_datetime = "{} {}".format(
-@@ -352,3 +357,15 @@ class StockLedgerEntry(Document):
+@@ -352,3 +356,15 @@ class StockLedgerEntry(Document):
  def on_doctype_update():
  	frappe.db.add_index("Stock Ledger Entry", ["voucher_no", "voucher_type"])
  	frappe.db.add_index("Stock Ledger Entry", ["item_code", "warehouse", "posting_datetime", "creation"])
@@ -349,23 +356,18 @@ index 4f6919e..6b77c5b 100644
 +			where="is_cancelled = 0",
 +		)
 diff --git a/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py b/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py
-index d01434f..8a9678d 100644
+index d01434f..0b69552 100644
 --- a/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py
 +++ b/erpnext/stock/doctype/stock_reservation_entry/stock_reservation_entry.py
-@@ -8,10 +8,10 @@ import frappe
+@@ -8,7 +8,7 @@ import frappe
  from frappe import _
  from frappe.model.document import Document
  from frappe.query_builder import Case
 -from frappe.query_builder.functions import Sum
--from frappe.utils import cint, flt, nowdate, nowtime, parse_json
 +from frappe.query_builder.functions import Max, Min, Sum
-+from frappe.utils import cint, flt, get_datetime, now_datetime, nowdate, nowtime, parse_json
+ from frappe.utils import cint, flt, nowdate, nowtime, parse_json
  
--from erpnext.stock.utils import get_or_make_bin, get_stock_balance
-+from erpnext.stock.utils import get_combine_datetime, get_or_make_bin, get_stock_balance
- 
- 
- class StockReservationEntry(Document):
+ from erpnext.stock.utils import get_or_make_bin, get_stock_balance
 @@ -700,20 +700,37 @@ def get_available_qty_to_reserve(
  
  	if available_qty:
@@ -472,10 +474,18 @@ index d01434f..8a9678d 100644
  				(child_doctype.required_qty - child_doctype.transferred_qty).as_("qty"),
  				child_doctype.stock_reserved_qty,
 diff --git a/erpnext/stock/report/available_batch_report/available_batch_report.py b/erpnext/stock/report/available_batch_report/available_batch_report.py
-index 84a6714..841f448 100644
+index 84a6714..3edcd88 100644
 --- a/erpnext/stock/report/available_batch_report/available_batch_report.py
 +++ b/erpnext/stock/report/available_batch_report/available_batch_report.py
-@@ -107,7 +107,9 @@ def get_batchwise_data_from_stock_ledger(filters):
+@@ -1,7 +1,6 @@
+ # Copyright (c) 2024, Frappe Technologies Pvt. Ltd. and contributors
+ # For license information, please see license.txt
+ 
+-from collections import defaultdict
+ 
+ import frappe
+ from frappe import _
+@@ -107,7 +106,9 @@ def get_batchwise_data_from_stock_ledger(filters):
  			Sum(table.actual_qty).as_("balance_qty"),
  		)
  		.where(table.is_cancelled == 0)
@@ -486,7 +496,7 @@ index 84a6714..841f448 100644
  	)
  
  	query = get_query_based_on_filters(query, batch, table, filters)
-@@ -138,7 +140,10 @@ def get_batchwise_data_from_serial_batch_bundle(batchwise_data, filters):
+@@ -138,7 +139,10 @@ def get_batchwise_data_from_serial_batch_bundle(batchwise_data, filters):
  			Sum(ch_table.qty).as_("balance_qty"),
  		)
  		.where((table.is_cancelled == 0) & (table.docstatus == 1))
@@ -499,9 +509,18 @@ index 84a6714..841f448 100644
  
  	query = get_query_based_on_filters(query, batch, table, filters)
 diff --git a/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py b/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py
-index 0315481..a0b2bef 100644
+index 0315481..12bc74f 100644
 --- a/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py
 +++ b/erpnext/stock/report/batch_wise_balance_history/batch_wise_balance_history.py
+@@ -4,7 +4,7 @@
+ 
+ import frappe
+ from frappe import _
+-from frappe.utils import add_to_date, cint, flt, get_datetime, get_table_name, getdate
++from frappe.utils import add_to_date, cint, flt, get_datetime, getdate
+ from pypika import functions as fn
+ 
+ from erpnext.accounts.report.utils import validate_mandatory_date_range
 @@ -137,7 +137,8 @@ def get_stock_ledger_entries_for_batch_no(filters):
  			sle.item_code,
  			sle.warehouse,
@@ -784,10 +803,10 @@ index e8e674e..e487a94 100644
  		return query.run(as_dict=True)
  
 diff --git a/erpnext/stock/stock_ledger.py b/erpnext/stock/stock_ledger.py
-index 9710c05..e4caf1d 100644
+index 9710c05..145cb58 100644
 --- a/erpnext/stock/stock_ledger.py
 +++ b/erpnext/stock/stock_ledger.py
-@@ -5,16 +5,15 @@ import copy
+@@ -5,6 +5,7 @@ import copy
  import gzip
  import json
  from collections import deque
@@ -795,10 +814,9 @@ index 9710c05..e4caf1d 100644
  
  import frappe
  from frappe import _, bold, scrub
- from frappe.model.meta import get_field_precision
+@@ -12,9 +13,7 @@ from frappe.model.meta import get_field_precision
  from frappe.query_builder import Order
--from frappe.query_builder.functions import Sum
-+from frappe.query_builder.functions import Lower, NullIf, Sum
+ from frappe.query_builder.functions import Sum
  from frappe.utils import (
 -	add_to_date,
  	cint,

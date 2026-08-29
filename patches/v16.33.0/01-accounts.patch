@@ -125,17 +125,10 @@ index 01191a7..967a8fc 100644
  
  	if frappe.flags.auto_reconcile_vouchers is True:
 diff --git a/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py b/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py
-index 3d45d04..79be07e 100644
+index 3d45d04..0491cfc 100644
 --- a/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py
 +++ b/erpnext/accounts/doctype/exchange_rate_revaluation/exchange_rate_revaluation.py
-@@ -1,13 +1,14 @@
- # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and contributors
- # For license information, please see license.txt
- 
-+from datetime import date
- 
- import frappe
- from frappe import _, qb
+@@ -7,7 +7,7 @@ from frappe import _, qb
  from frappe.model.document import Document
  from frappe.model.meta import get_field_precision
  from frappe.query_builder import Criterion, Order
@@ -144,7 +137,7 @@ index 3d45d04..79be07e 100644
  from frappe.utils import flt, get_link_to_form, nowdate
  
  import erpnext
-@@ -212,12 +213,18 @@ class ExchangeRateRevaluation(Document):
+@@ -212,12 +212,18 @@ class ExchangeRateRevaluation(Document):
  				accounts = [x[0] for x in res]
  
  			if accounts:
@@ -167,7 +160,7 @@ index 3d45d04..79be07e 100644
  				# conditions
  				conditions = []
  				conditions.append(gle.account.isin(accounts))
-@@ -233,17 +240,15 @@ class ExchangeRateRevaluation(Document):
+@@ -233,17 +239,15 @@ class ExchangeRateRevaluation(Document):
  					qb.from_(gle)
  					.select(
  						gle.account,
@@ -195,18 +188,10 @@ index 3d45d04..79be07e 100644
  					.where(Criterion.all(conditions))
  					.groupby(gle.account, NullIf(gle.party_type, ""), NullIf(gle.party, ""))
 diff --git a/erpnext/accounts/doctype/gl_entry/gl_entry.py b/erpnext/accounts/doctype/gl_entry/gl_entry.py
-index 452164c..71fd935 100644
+index 452164c..e8ebcca 100644
 --- a/erpnext/accounts/doctype/gl_entry/gl_entry.py
 +++ b/erpnext/accounts/doctype/gl_entry/gl_entry.py
-@@ -7,6 +7,7 @@ from frappe import _
- from frappe.model.document import Document
- from frappe.model.meta import get_field_precision
- from frappe.model.naming import set_name_from_naming_options
-+from frappe.query_builder.functions import Sum
- from frappe.utils import create_batch, flt, fmt_money, now
- 
- import erpnext
-@@ -464,6 +465,25 @@ def on_doctype_update():
+@@ -464,6 +464,25 @@ def on_doctype_update():
  	frappe.db.add_index("GL Entry", ["posting_date", "company"])
  	frappe.db.add_index("GL Entry", ["party_type", "party"])
  
@@ -233,9 +218,18 @@ index 452164c..71fd935 100644
  def rename_gle_sle_docs():
  	for doctype in ["GL Entry", "Stock Ledger Entry"]:
 diff --git a/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py b/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py
-index be6f8dd..6e67d16 100644
+index be6f8dd..d2cea78 100644
 --- a/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py
 +++ b/erpnext/accounts/doctype/process_period_closing_voucher/process_period_closing_voucher.py
+@@ -8,7 +8,7 @@ import frappe
+ from frappe import qb
+ from frappe.model.document import Document
+ from frappe.query_builder.functions import Count, Max, Min, Sum
+-from frappe.utils import add_days, flt, get_datetime
++from frappe.utils import flt, get_datetime
+ from frappe.utils.scheduler import is_scheduler_inactive
+ 
+ from erpnext.accounts.doctype.account_closing_balance.account_closing_balance import (
 @@ -568,7 +568,8 @@ def process_individual_date(docname: str, row_name, date, report_type, parentfie
  		Sum(gle.credit).as_("credit"),
  		Sum(gle.debit_in_account_currency).as_("debit_in_account_currency"),
@@ -347,10 +341,18 @@ index 02cad39..86261e6 100644
  		for row in selections:
  			unrecon = frappe.new_doc("Unreconcile Payment")
 diff --git a/erpnext/accounts/report/accounts_receivable/accounts_receivable.py b/erpnext/accounts/report/accounts_receivable/accounts_receivable.py
-index 8f6ee26..ed6362b 100644
+index 8f6ee26..ad9279e 100644
 --- a/erpnext/accounts/report/accounts_receivable/accounts_receivable.py
 +++ b/erpnext/accounts/report/accounts_receivable/accounts_receivable.py
-@@ -686,11 +686,14 @@ class ReceivablePayableReport:
+@@ -6,7 +6,6 @@ from collections import OrderedDict
+ 
+ import frappe
+ from frappe import _, qb, query_builder, scrub
+-from frappe.database.schema import get_definition
+ from frappe.permissions import get_allowed_docs_for_doctype
+ from frappe.query_builder import Criterion
+ from frappe.query_builder.functions import Date, Substring, Sum
+@@ -686,11 +685,14 @@ class ReceivablePayableReport:
  				(pe.posting_date).as_("future_date"),
  				(pe_ref.allocated_amount).as_("future_amount"),
  				(pe.reference_no).as_("future_ref"),
@@ -368,7 +370,7 @@ index 8f6ee26..ed6362b 100644
  			)
  			.where(
  				(pe.docstatus < 2)
-@@ -724,30 +727,33 @@ class ReceivablePayableReport:
+@@ -724,30 +726,33 @@ class ReceivablePayableReport:
  
  		if self.filters.get("party"):
  			if self.account_type == "Payable":
@@ -1162,7 +1164,7 @@ index 7c2bf7e..470bd56 100644
  
  import frappe
  from frappe import _
-+from frappe.query_builder.functions import Coalesce, Max, Min, Sum
++from frappe.query_builder.functions import Max, Min, Sum
  from frappe.utils import cstr
  
  

@@ -1,5 +1,5 @@
 diff --git a/erpnext/manufacturing/doctype/bom/bom.py b/erpnext/manufacturing/doctype/bom/bom.py
-index d90c57b..5f2e888 100644
+index d90c57b..46f7a39 100644
 --- a/erpnext/manufacturing/doctype/bom/bom.py
 +++ b/erpnext/manufacturing/doctype/bom/bom.py
 @@ -1418,19 +1418,33 @@ def get_bom_items_as_dict(
@@ -33,7 +33,7 @@ index d90c57b..5f2e888 100644
 -				item_default.default_warehouse,
 -				item_default.expense_account as expense_account,
 -				item_default.buying_cost_center as cost_center
-+				max(bom_item.idx) as idx,
++				min(bom_item.idx) as idx,
 +				max(item.item_name) as item_name,
 +				sum(bom_item.{qty_field}/coalesce(bom.quantity, 1)) * %(qty)s as qty,
 +				max(item.image) as image,
@@ -103,18 +103,20 @@ index d90c57b..5f2e888 100644
  		items = frappe.db.sql(query, {"qty": qty, "bom": bom, "company": company}, as_dict=True)
  
 diff --git a/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py b/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
-index 5957812..53decb2 100644
+index 5957812..9148cb7 100644
 --- a/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
 +++ b/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
-@@ -3,7 +3,7 @@
+@@ -3,8 +3,8 @@
  
  import frappe
  from frappe import _
 -from frappe.query_builder.functions import Floor, IfNull, Sum
+-from frappe.utils import flt, fmt_money
 +from frappe.query_builder.functions import Floor, IfNull, Max, Min, Sum
- from frappe.utils import flt, fmt_money
++from frappe.utils import flt
  from frappe.utils.data import comma_and
  from pypika.terms import ExistsCriterion
+ 
 @@ -202,14 +202,18 @@ def get_bom_data(filters):
  		.on(bom_item.item_code == bin.item_code)
  		.select(
