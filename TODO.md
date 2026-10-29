@@ -133,7 +133,7 @@ catches `GROUP BY`-shaped problems; a shared helper with a *different* kind
 of MariaDB-only SQL (index hints, in this case) needs a live smoke test of
 each affected report, not just a static audit, to catch reliably.
 
-## 5. Period-closing path: `financial_statements.py` + `general_ledger.py` [DONE 2026-10-29 — image `-4` built, NOT deployed]
+## 5. Period-closing path: `financial_statements.py` + `general_ledger.py` [DONE 2026-10-29 — image `-4` deployed]
 
 Reported from a read-only survey of production (2026-10-29): a direct call to
 `get_accounting_entries("Account Closing Balance", ..., group_by_account=True)`
@@ -171,8 +171,11 @@ the end of N, and Balance Sheet N+1 is the same through ACB or through GL only.
 Pushed as `b04447f`; image `v16.33.0-4` built from it (manifest
 `sha256:6de1804b6ccf5468b83c9cd42c54b9de7c0e71e6bc98699f91721b9af48ec878`) and
 checked in a throwaway pod: all 44 patched files match the verified tree.
-**Pending: deploy, only after the migration team gives the go-ahead** (they
-are mid-load of the 2025 books). Production stays on `-3` until then.
+Deployed to production on 2026-10-29 once the migration team gave the
+go-ahead (between two steps of the 2025 load, nothing running against the
+site); all pods run the `-4` digest, clean startup. The migration team runs
+the post-deploy checks (file SHA-256s, grouped ACB call, a Journal Entry
+submit with rollback).
 
 Out of scope, same `get_value` + aggregate pattern, not on the posting path
 of an accounting-only deployment, not checked live:
