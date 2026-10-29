@@ -132,3 +132,49 @@ committing to a full rebuild — confirmed working, then shipped as
 catches `GROUP BY`-shaped problems; a shared helper with a *different* kind
 of MariaDB-only SQL (index hints, in this case) needs a live smoke test of
 each affected report, not just a static audit, to catch reliably.
+
+## 5. Period-closing path: `financial_statements.py` + `general_ledger.py` [PATCH DONE 2026-10-29 — image not built yet]
+
+Reported from a read-only survey of production (2026-10-29): a direct call to
+`get_accounting_entries("Account Closing Balance", ..., group_by_account=True)`
+fails with `GroupingError` on `closing_date`. The image `-3` patch wrapped the
+GL Entry branch's columns in `Max()` but not `closing_date` in the Account
+Closing Balance branch.
+
+- `accounts/report/financial_statements.py`: `Max(closing_date)` when grouping
+  by account, byte-identical to `develop`. Safe: both writers of Account Closing
+  Balance (`period_closing_voucher.py:601`, legacy, and
+  `process_period_closing_voucher.py:451`) set `closing_date =
+  period_end_date` on every row of a PCV, and the query filters on one PCV.
+  **No standard v16.33.0 report reaches this branch**: the only callers with
+  `group_by_account=True` are Trial Balance and Consolidated Trial Balance, and
+  both always pass `from_date` (`trial_balance.py:54-55`), which skips the
+  Account Closing Balance read. Balance Sheet / P&L read it ungrouped. Verified
+  on the test site: with a PCV submitted, all four reports for N+1 run clean on
+  the `-3` code too. The fix is defensive (direct callers, custom code).
+- `accounts/general_ledger.py` (found while building the test scenario):
+  `validate_against_pcv` runs on **every** ledger posting and calls
+  `frappe.db.get_value(..., [{"MAX": "period_end_date"}])`, which Frappe 16
+  turns into `SELECT MAX(...) ... ORDER BY creation` → `GroupingError`. No
+  Journal Entry / invoice / payment can be submitted on PostgreSQL with `-3`.
+  Fixed with `order_by=None`. Not fixed upstream (ERPNext `develop` has the same
+  call; Frappe `version-16` 16.54 still adds the default order).
+- Upstream v16: the `version-16` branch (up to v16.53.0, 2026-10-28) has
+  neither fix; only `develop` has the `financial_statements.py` one.
+
+Verified on a local Docker site (fresh v16.33.0, PostgreSQL 17, legacy PCV
+controller): old (`-3` patches) vs new images on the same DB, with and without
+a PCV. The direct grouped call is the only difference; everything else is
+identical. N+1 opening balances = Account Closing Balance = the ledger up to
+the end of N, and Balance Sheet N+1 is the same through ACB or through GL only.
+
+Pending: push, build image `v16.33.0-4`, deploy **only after the migration
+team (migracion-contable-2025) gives the go-ahead** (they are mid-load).
+
+Out of scope, same `get_value` + aggregate pattern, not on the posting path
+of an accounting-only deployment, not checked live:
+`stock/doctype/stock_closing_entry/stock_closing_entry.py:30`,
+`stock/doctype/packing_slip/packing_slip.py:177`,
+`manufacturing/doctype/work_order/work_order.py:2740`,
+`setup/doctype/sales_person/sales_person.py:64,72`,
+`accounts/report/item_wise_sales_register/item_wise_sales_register.py:524`.

@@ -50,12 +50,12 @@ closed as *not planned*.
 
 ## What is fixed
 
-43 files, 147 hunks, grouped by module so a single failing hunk after a future
+44 files, 148 hunks, grouped by module so a single failing hunk after a future
 upgrade tells you exactly what broke:
 
 | Patch | Files | Hunks |
 |---|---|---|
-| `01-accounts.patch` | 18 | 62 |
+| `01-accounts.patch` | 19 | 63 |
 | `02-buying.patch` | 3 | 8 |
 | `03-selling.patch` | 4 | 11 |
 | `04-stock.patch` | 13 | 51 |
@@ -65,7 +65,9 @@ upgrade tells you exactly what broke:
 
 `01-accounts.patch` is the one most deployments need: Trial Balance, Accounts
 Receivable, Sales and Purchase Register, bank clearance and reconciliation, plus
-the `gl_entry.py` and `accounts/utils.py` runtime paths.
+the `gl_entry.py`, `general_ledger.py` and `accounts/utils.py` runtime paths.
+Without `general_ledger.py`, submitting any document that posts to the ledger
+(Journal Entry, invoices, payments) fails on PostgreSQL.
 
 The changes cover several distinct MariaDB-vs-PostgreSQL differences:
 
@@ -85,6 +87,10 @@ The changes cover several distinct MariaDB-vs-PostgreSQL differences:
 - **MariaDB-only index hints** — `FORCE INDEX (...)`, which PostgreSQL has no
   equivalent for (its planner picks the index on its own); guarded on
   `frappe.db.db_type` and dropped entirely on PostgreSQL.
+- **Default ORDER BY next to an aggregate** — `frappe.db.get_value()` with an
+  aggregate field (`[{"MAX": ...}]`) still appends `ORDER BY creation`, which
+  PostgreSQL rejects; `order_by=None` is passed, as Frappe does in its own
+  internal lookups. The result is a single row, so the order never mattered.
 - **Collation-dependent ordering** — explicit `casefold` sorting so column order
   is identical on both backends.
 
@@ -95,11 +101,12 @@ Each change carries a comment explaining why it is safe.
 Most hunks are **backported verbatim** from `develop`: same code, same comments,
 verified to reproduce upstream's state exactly.
 
-Eight files could not be backported and were **written by hand** against
+Nine files could not be backported and were **written by hand** against
 v16.33.0's own code:
 
 | File | Why it could not be backported |
 |---|---|
+| `accounts/general_ledger` | not fixed upstream: ERPNext `develop` makes the same call in `validate_against_pcv`, and Frappe's `version-16` branch (16.54) still adds the default ORDER BY next to `MAX()` |
 | `accounts/report/budget_variance_report` | fix is entangled with a `CustomFunction` → `MonthName` refactor |
 | `accounts/report/inactive_sales_items` | upstream fix relies on Frappe 17 helpers (see below) |
 | `selling/report/inactive_customers` | same |
@@ -164,7 +171,7 @@ checking that:
 
 - all 7 patches apply with no fuzz, and the result is byte-identical to the
   curated tree;
-- all 43 files compile;
+- all 44 files compile;
 - no new undefined names appear versus unpatched v16.33.0
   (`tools/check_undefined_names.py`);
 - no `SELECT` column remains ungrouped and unaggregated
@@ -189,6 +196,13 @@ caught the `financial_statements.py` gap above. That is real-world
 verification on one deployment's data shape, though, not a substitute for a
 proper test suite against a range of data.
 
+The period-closing path was exercised separately, on a fresh v16.33.0 site on
+PostgreSQL 17: journal entries in year N, a submitted Period Closing Voucher for
+N (legacy controller), then Trial Balance, Balance Sheet, Profit and Loss and
+General Ledger for N and N+1, with N+1 opening balances matching the Account
+Closing Balance rows and the general ledger. That run is what caught the
+`general_ledger.py` gap: no journal entry could be submitted at all.
+
 ## Provenance and license
 
 Most patch content is derived from [frappe/erpnext][erpnext] `develop`. ERPNext
@@ -198,5 +212,11 @@ re-targets them, and adds hand-written equivalents where the upstream fix could
 not be carried over.
 
 Built against ERPNext v16.33.0 with Frappe 16.31.0 on PostgreSQL.
+
+Known issue outside this patch set: a **fresh** `bench new-site --db-type
+postgres` with the official `frappe/erpnext:v16.33.0` image fails while
+installing ERPNext, because ERPNext 16.33.0 calls `frappe.db.add_index(...,
+where=...)` on PostgreSQL and Frappe 16.31.0 does not accept that argument.
+Existing sites are unaffected; the indexes involved are for performance only.
 
 [erpnext]: https://github.com/frappe/erpnext
