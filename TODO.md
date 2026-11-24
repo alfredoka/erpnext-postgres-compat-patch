@@ -122,6 +122,8 @@ Two upstream reports were considered, from `mcp-frappe/CLAUDE.md`:
   `link_filters` is `fieldtype: JSON`, and confirmed the failure is in the
   read-side filter — `frappe.db.set_value` is never reached, so no data
   corruption, just a silently-incomplete backfill on Postgres.
+  Fixed upstream on `develop` only (`bee358ea2`, #59018); carried in the
+  v16.60.0 set (`11-patches.patch`) since it stopped a 16.33 → 16.60 migrate.
 
 ## 4. Deploy the finished patch [DONE 2026-08-29]
 

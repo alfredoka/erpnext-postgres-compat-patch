@@ -197,7 +197,7 @@ of ERPNext's own migration patches.
 
 ### What is covered
 
-80 files, 249 hunks, in 16 patches, one per top-level ERPNext
+82 files, 251 hunks, in 16 patches, one per top-level ERPNext
 module (the v16.33.0 set needed 7):
 
 | Patch | Area |
@@ -212,7 +212,7 @@ module (the v16.33.0 set needed 7):
 | `08-assets.patch` | daily depreciation job |
 | `09-controllers.patch` | shared document controllers and link-field searches |
 | `10-crm.patch` | Sales Pipeline Analytics, Lost Opportunity |
-| `11-patches.patch` | one ERPNext migration patch |
+| `11-patches.patch` | three ERPNext migration patches |
 | `12-projects.patch` | timesheets |
 | `13-regional.patch` | UAE VAT 201 |
 | `14-setup.patch` | company history, Email Digest, Sales Person |
@@ -250,6 +250,18 @@ By area:
   `recalculate_bins_for_production_plan_items`, reaches
   `stock_balance.get_reserved_qty` (fixed under stock), and only on a site with
   open production plans.
+- **The SLA link-filter backfill patches.**
+  `erpnext.patches.v15_0.backfill_sla_link_filters_on_custom_field` and
+  `..._on_docfield` filter `"link_filters": ("is", "not set")`; `link_filters` is a
+  JSON column, and Frappe 16.60's query builder renders that as
+  `("link_filters" IS NULL OR "link_filters"='')`, which PostgreSQL rejects
+  (`operator does not exist: json = unknown`), so `bench migrate` stops there
+  (frappe/erpnext#58547). A site migrated earlier with `--skip-failing` has them
+  as skipped, and Frappe retries skipped patches on the next migrate. The fix is
+  upstream's own, byte for byte (develop `bee358ea2`, frappe/erpnext#59018, not
+  backported to `version-16`): read `link_filters` with the other fields and skip
+  the rows that already have one. Frappe `develop` also fixes the general case by
+  casting JSON columns to text in filters (`frappe/database/query.py`).
 - **Documents and controllers.** Payment Entry (`before_save` with references,
   *Get Outstanding Invoices*, orders to be billed), credit and debit notes and
   delivery returns, advance totals, the daily invoice-status job, landed-cost

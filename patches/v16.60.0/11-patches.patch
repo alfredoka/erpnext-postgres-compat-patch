@@ -1,3 +1,41 @@
+diff --git a/erpnext/patches/v15_0/backfill_sla_link_filters_on_custom_field.py b/erpnext/patches/v15_0/backfill_sla_link_filters_on_custom_field.py
+index 65996f2..f6a0e22 100644
+--- a/erpnext/patches/v15_0/backfill_sla_link_filters_on_custom_field.py
++++ b/erpnext/patches/v15_0/backfill_sla_link_filters_on_custom_field.py
+@@ -8,10 +8,12 @@ def execute():
+ 			"fieldname": "service_level_agreement",
+ 			"fieldtype": "Link",
+ 			"options": "Service Level Agreement",
+-			"link_filters": ("is", "not set"),
+ 		},
+-		fields=["name", "dt"],
++		fields=["name", "dt", "link_filters"],
+ 	):
++		if custom_field.link_filters:
++			continue
++
+ 		link_filters = frappe.as_json(
+ 			[["Service Level Agreement", "document_type", "=", custom_field.dt]], indent=None
+ 		)
+diff --git a/erpnext/patches/v15_0/backfill_sla_link_filters_on_docfield.py b/erpnext/patches/v15_0/backfill_sla_link_filters_on_docfield.py
+index 22110af..f3bbdd8 100644
+--- a/erpnext/patches/v15_0/backfill_sla_link_filters_on_docfield.py
++++ b/erpnext/patches/v15_0/backfill_sla_link_filters_on_docfield.py
+@@ -9,10 +9,12 @@ def execute():
+ 			"fieldname": "service_level_agreement",
+ 			"fieldtype": "Link",
+ 			"options": "Service Level Agreement",
+-			"link_filters": ("is", "not set"),
+ 		},
+-		fields=["name", "parent"],
++		fields=["name", "parent", "link_filters"],
+ 	):
++		if docfield.link_filters:
++			continue
++
+ 		link_filters = frappe.as_json(
+ 			[["Service Level Agreement", "document_type", "=", docfield.parent]], indent=None
+ 		)
 diff --git a/erpnext/patches/v16_0/set_outstanding_for_zero_portion_payment_terms.py b/erpnext/patches/v16_0/set_outstanding_for_zero_portion_payment_terms.py
 index 6bc9a9a..997d0e0 100644
 --- a/erpnext/patches/v16_0/set_outstanding_for_zero_portion_payment_terms.py
