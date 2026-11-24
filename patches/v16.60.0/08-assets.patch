@@ -1,0 +1,15 @@
+diff --git a/erpnext/assets/doctype/asset/depreciation.py b/erpnext/assets/doctype/asset/depreciation.py
+index b91bbf1..36f08fb 100644
+--- a/erpnext/assets/doctype/asset/depreciation.py
++++ b/erpnext/assets/doctype/asset/depreciation.py
+@@ -98,7 +98,9 @@ def get_depreciable_assets_data(date):
+ 		.where(a.status.isin(["Submitted", "Partially Depreciated", "In Maintenance"]))
+ 		.where(ds.journal_entry.isnull())
+ 		.where(ds.schedule_date <= date)
+-		.groupby(ads.name)
++		# a.name/a.creation are constant per ads.name; include them so postgres accepts the
++		# SELECT and ORDER BY (one row per Asset Depreciation Schedule either way)
++		.groupby(ads.name, a.name, a.creation)
+ 		.orderby(a.creation, order=Order.desc)
+ 	)
+ 

@@ -1,0 +1,473 @@
+diff --git a/erpnext/manufacturing/doctype/bom/bom.py b/erpnext/manufacturing/doctype/bom/bom.py
+index f757cf0..1d22f3f 100644
+--- a/erpnext/manufacturing/doctype/bom/bom.py
++++ b/erpnext/manufacturing/doctype/bom/bom.py
+@@ -12,7 +12,7 @@ from frappe.core.doctype.version.version import get_diff
+ from frappe.model.document import Document
+ from frappe.model.mapper import get_mapped_doc
+ from frappe.query_builder import Field
+-from frappe.query_builder.functions import Count, IfNull, Sum
++from frappe.query_builder.functions import Count, IfNull, NullIf, Sum
+ from frappe.utils import cint, cstr, flt, get_link_to_form, parse_json, today
+ from frappe.website.website_generator import WebsiteGenerator
+ 
+@@ -1585,7 +1585,10 @@ def get_valuation_rate(data):
+ 		.select(
+ 			Case()
+ 			.when(
+-				Count(bin_table.name) > 0, IfNull(Sum(bin_table.stock_value) / Sum(bin_table.actual_qty), 0.0)
++				Count(bin_table.name) > 0,
++				# NullIf: postgres raises on a division by zero (all bins at zero qty), MariaDB returns
++				# NULL; dividing by NULL gives that same NULL -> IfNull 0.0 on both engines (as develop).
++				IfNull(Sum(bin_table.stock_value) / NullIf(Sum(bin_table.actual_qty), 0), 0.0),
+ 			)
+ 			.else_(None)
+ 			.as_("valuation_rate")
+@@ -1653,30 +1656,52 @@ def get_bom_items_as_dict(
+ 
+ 	item_dict = {}
+ 
+-	group_by_cond = "group by item_code, stock_uom, operation"
++	# The group-by columns are qualified: item_code and stock_uom exist both on the line table and on
++	# tabItem, and postgres rejects an ambiguous bare name in GROUP BY. These are the columns MariaDB
++	# resolved the bare names to (the select-list ones: bom_item.item_code, item.stock_uom), and the
++	# ones develop groups by. Qualifying also keeps MariaDB from resolving "stock_uom" to the
++	# max(item.stock_uom) alias below, which it cannot group on.
++	group_by_cond = "group by bom_item.item_code, item.stock_uom, bom_item.operation"
+ 	if frappe.get_cached_value("BOM", bom, "track_semi_finished_goods"):
+ 		fetch_exploded = 0
+-		group_by_cond = "group by item_code, operation_row_id, stock_uom"
++		group_by_cond = "group by bom_item.item_code, bom_item.operation_row_id, item.stock_uom"
+ 
+ 	if fetch_secondary_items:
+ 		fetch_exploded = 0
+-		group_by_cond = "group by item_code, secondary_item_type"
++		group_by_cond = "group by bom_item.item_code, bom_item.secondary_item_type"
+ 
+ 	# Did not use qty_consumed_per_unit in the query, as it leads to rounding loss
++	# Postgres rejects non-grouped, non-aggregated columns, and {group_by_cond} varies by branch
++	# (operation and stock_uom are not always grouped), so every such column is wrapped in max().
++	# The item-level ones here are functionally dependent on the grouped item_code, so max() returns
++	# the value MariaDB picked arbitrarily. Each keeps an explicit alias because the query runs with
++	# as_dict=True and the caller reads these keys. Wrapping a column that IS grouped is a no-op.
++	# ifnull() is MariaDB-only; coalesce() is standard and behaves identically on both engines.
++	#
++	# is_phantom_item and bom_no are the one pair that must NOT get this treatment: the loop below
++	# recurses into bom_no whenever is_phantom_item is set, so an independent max() per column could
++	# pair one line's phantom flag with a different line's bom_no and explode the wrong sub-BOM.
++	# Like develop, the BOM Item branch groups by the (bom_no, is_phantom_item) pair itself instead.
++	#
++	# KNOWN LIMITATION: the line-level columns (description, source_warehouse, uom, conversion_factor,
++	# rate...) also get an independent per-column max(), as in the v16.33.0 patch. When a BOM lists the
++	# same item on several lines of one group, they can mix values from different lines (e.g. one
++	# line's uom with another's conversion_factor), and max() over text follows each engine's
++	# collation, so MariaDB and postgres can pick different values. To be reviewed.
+ 	query = """select
+ 				bom_item.item_code,
+-				bom_item.idx,
+-				item.item_name,
+-				sum(bom_item.{qty_field}/ifnull(bom.quantity, 1)) * %(qty)s as qty,
+-				sum(bom_item.stock_qty/ifnull(bom.quantity, 1)) * %(qty)s as stock_qty,
+-				item.image,
+-				bom.project,
+-				item.stock_uom,
+-				item.item_group,
+-				item.allow_alternative_item,
+-				item_default.default_warehouse,
+-				item_default.expense_account as expense_account,
+-				item_default.buying_cost_center as cost_center
++				min(bom_item.idx) as idx,
++				max(item.item_name) as item_name,
++				sum(bom_item.{qty_field}/coalesce(bom.quantity, 1)) * %(qty)s as qty,
++				sum(bom_item.stock_qty/coalesce(bom.quantity, 1)) * %(qty)s as stock_qty,
++				max(item.image) as image,
++				max(bom.project) as project,
++				max(item.stock_uom) as stock_uom,
++				max(item.item_group) as item_group,
++				max(item.allow_alternative_item) as allow_alternative_item,
++				max(item_default.default_warehouse) as default_warehouse,
++				max(item_default.expense_account) as expense_account,
++				max(item_default.buying_cost_center) as cost_center
+ 				{select_columns}
+ 			from
+ 				`tab{table}` bom_item
+@@ -1690,7 +1715,7 @@ def get_bom_items_as_dict(
+ 				and (item.is_stock_item in (1, {is_stock_item})
+ 				{where_conditions}
+ 				{group_by_cond}
+-				order by idx"""
++				order by min(bom_item.idx)"""
+ 
+ 	is_stock_item = cint(not include_non_stock_items)
+ 	if cint(fetch_exploded):
+@@ -1700,9 +1725,10 @@ def get_bom_items_as_dict(
+ 			is_stock_item=is_stock_item,
+ 			qty_field="stock_qty",
+ 			group_by_cond=group_by_cond,
+-			select_columns=""", bom_item.source_warehouse, bom_item.operation,
+-				bom_item.include_item_in_manufacturing, bom_item.description, bom_item.rate, bom_item.sourced_by_supplier,
+-				sum(bom_item.stock_qty/ifnull(bom.quantity, 1)) * bom_item.rate * %(qty)s as amount,
++			select_columns=""", max(bom_item.source_warehouse) as source_warehouse, max(bom_item.operation) as operation,
++				max(bom_item.include_item_in_manufacturing) as include_item_in_manufacturing, max(bom_item.description) as description,
++				max(bom_item.rate) as rate, max(bom_item.sourced_by_supplier) as sourced_by_supplier,
++				sum(bom_item.stock_qty/coalesce(bom.quantity, 1)) * max(bom_item.rate) * %(qty)s as amount,
+ 				(Select idx from `tabBOM Item` where item_code = bom_item.item_code and parent = %(parent)s limit 1) as idx""",
+ 		)
+ 
+@@ -1710,10 +1736,12 @@ def get_bom_items_as_dict(
+ 			query, {"parent": bom, "qty": qty, "bom": bom, "company": company}, as_dict=True
+ 		)
+ 	elif fetch_secondary_items:
++		# grouped by (item_code, secondary_item_type), which validate_secondary_items keeps unique, so
++		# every max() returns the single grouped row's own value.
+ 		query = query.format(  # nosemgrep
+ 			table="BOM Secondary Item",
+ 			where_conditions=")",
+-			select_columns=", item.description, bom_item.cost_allocation_per, bom_item.process_loss_per, bom_item.secondary_item_type, bom_item.name, bom_item.valuation_type, bom_item.base_cost / nullif(bom_item.stock_qty, 0) as manual_rate",
++			select_columns=", max(item.description) as description, max(bom_item.cost_allocation_per) as cost_allocation_per, max(bom_item.process_loss_per) as process_loss_per, bom_item.secondary_item_type, max(bom_item.name) as name, max(bom_item.valuation_type) as valuation_type, max(bom_item.base_cost / nullif(bom_item.stock_qty, 0)) as manual_rate",
+ 			is_stock_item=is_stock_item,
+ 			qty_field="stock_qty",
+ 			group_by_cond=group_by_cond,
+@@ -1723,18 +1751,25 @@ def get_bom_items_as_dict(
+ 	else:
+ 		rate_col = "bom_item.base_rate"
+ 		if fetch_qty_in_stock_uom:
+-			rate_col += " / ifnull(nullif(bom_item.conversion_factor, 0), 1)"
++			rate_col += " / coalesce(nullif(bom_item.conversion_factor, 0), 1)"
+ 
+ 		query = query.format(
+ 			table="BOM Item",
+-			where_conditions="or bom_item.is_phantom_item)",
++			# "= 1": postgres needs a boolean operand for OR, and is_phantom_item is a smallint there
++			where_conditions="or bom_item.is_phantom_item = 1)",
+ 			is_stock_item=is_stock_item,
+ 			qty_field="stock_qty" if fetch_qty_in_stock_uom else "qty",
+-			select_columns=f""", bom_item.rate, bom_item.uom, bom_item.conversion_factor, bom_item.source_warehouse,
+-				bom_item.operation, bom_item.include_item_in_manufacturing, bom_item.sourced_by_supplier,
+-				sum(bom_item.stock_qty/ifnull(bom.quantity, 1)) * bom_item.rate * %(qty)s as amount,
+-				bom_item.description, {rate_col} as rate, bom_item.operation_row_id, bom_item.is_phantom_item , bom_item.bom_no """,
+-			group_by_cond=group_by_cond,
++			select_columns=f""", max(bom_item.rate) as rate, max(bom_item.uom) as uom, max(bom_item.conversion_factor) as conversion_factor,
++				max(bom_item.source_warehouse) as source_warehouse,
++				max(bom_item.operation) as operation, max(bom_item.include_item_in_manufacturing) as include_item_in_manufacturing,
++				max(bom_item.sourced_by_supplier) as sourced_by_supplier,
++				sum(bom_item.stock_qty/coalesce(bom.quantity, 1)) * max(bom_item.rate) * %(qty)s as amount,
++				max(bom_item.description) as description, max({rate_col}) as rate, max(bom_item.operation_row_id) as operation_row_id,
++				bom_item.is_phantom_item, bom_item.bom_no """,
++			# grouping by the (bom_no, is_phantom_item) pair itself (instead of max()-ing each
++			# independently) guarantees every returned row's pair actually co-occurred on some real
++			# BOM Item line -- see the note above the query template.
++			group_by_cond=group_by_cond + ", bom_item.bom_no, bom_item.is_phantom_item",
+ 		)
+ 		items = frappe.db.sql(query, {"qty": qty, "bom": bom, "company": company}, as_dict=True)
+ 
+diff --git a/erpnext/manufacturing/doctype/job_card/job_card.py b/erpnext/manufacturing/doctype/job_card/job_card.py
+index 91892ea..c57ca08 100644
+--- a/erpnext/manufacturing/doctype/job_card/job_card.py
++++ b/erpnext/manufacturing/doctype/job_card/job_card.py
+@@ -1334,6 +1334,7 @@ class JobCard(Document):
+ 		wo.save()
+ 
+ 	def get_current_operation_data(self):
++		# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
+ 		return frappe.get_all(
+ 			"Job Card",
+ 			fields=[
+@@ -1348,6 +1349,7 @@ class JobCard(Document):
+ 				"operation_id": self.operation_id,
+ 				"is_corrective_job_card": 0,
+ 			},
++			order_by=None,
+ 		)
+ 
+ 	def set_consumed_qty_in_job_card_item(self, ste_doc):
+diff --git a/erpnext/manufacturing/doctype/production_plan/production_plan.py b/erpnext/manufacturing/doctype/production_plan/production_plan.py
+index 51cfee3..b9136d2 100644
+--- a/erpnext/manufacturing/doctype/production_plan/production_plan.py
++++ b/erpnext/manufacturing/doctype/production_plan/production_plan.py
+@@ -12,7 +12,7 @@ from frappe import _, msgprint
+ from frappe.model.document import Document
+ from frappe.model.mapper import get_mapped_doc
+ from frappe.query_builder import Case
+-from frappe.query_builder.functions import IfNull, Max, Sum
++from frappe.query_builder.functions import IfNull, Max, Min, Sum
+ from frappe.utils import (
+ 	add_days,
+ 	ceil,
+@@ -1589,21 +1589,22 @@ def get_exploded_items(item_details, company, bom_no, include_non_stock_items, p
+ 		.left_join(item_uom)
+ 		.on((item.name == item_uom.parent) & (item_uom.uom == item.purchase_uom))
+ 		.select(
++			# KNOWN LIMITATION: per-column max() can mix values from different BOM lines of the same
++			# item; to be reviewed
+ 			(IfNull(Sum(bei.stock_qty / IfNull(bom.quantity, 1)), 0) * planned_qty).as_("qty"),
+-			item.item_name,
+-			item.name.as_("item_code"),
+-			bei.description,
++			Max(item.item_name).as_("item_name"),
++			Max(item.name).as_("item_code"),
++			Max(bei.description).as_("description"),
++			Max(bei.source_warehouse).as_("source_warehouse"),
+ 			bei.stock_uom,
+-			item.min_order_qty,
+-			bei.source_warehouse,
+-			item.default_material_request_type,
+-			item.min_order_qty,
+-			item_default.default_warehouse,
+-			item.purchase_uom,
+-			item_uom.conversion_factor,
+-			item.safety_stock,
+-			bom.item.as_("main_bom_item"),
+-			bom.name.as_("main_bom"),
++			Max(item.min_order_qty).as_("min_order_qty"),
++			Max(item.default_material_request_type).as_("default_material_request_type"),
++			Max(item_default.default_warehouse).as_("default_warehouse"),
++			Max(item.purchase_uom).as_("purchase_uom"),
++			Max(item_uom.conversion_factor).as_("conversion_factor"),
++			Max(item.safety_stock).as_("safety_stock"),
++			Max(bom.item).as_("main_bom_item"),
++			Max(bom.name).as_("main_bom"),
+ 		)
+ 		.where(
+ 			(bei.docstatus < 2)
+@@ -1696,26 +1697,28 @@ def get_subitems(
+ 		.left_join(item_uom)
+ 		.on((item.name == item_uom.parent) & (item_uom.uom == item.purchase_uom))
+ 		.select(
++			# KNOWN LIMITATION: per-column max() can mix values from different BOM lines of the same
++			# item; to be reviewed
+ 			bom_item.item_code,
+-			item.default_material_request_type,
+-			item.item_name,
++			Max(item.default_material_request_type).as_("default_material_request_type"),
++			Max(item.item_name).as_("item_name"),
+ 			IfNull(parent_qty * Sum(bom_item.stock_qty / IfNull(bom.quantity, 1)) * planned_qty, 0).as_(
+ 				"qty"
+ 			),
+-			item.is_sub_contracted_item.as_("is_sub_contracted"),
+-			bom_item.source_warehouse,
+-			item.default_bom.as_("default_bom"),
++			Max(item.is_sub_contracted_item).as_("is_sub_contracted"),
++			Max(bom_item.source_warehouse).as_("source_warehouse"),
++			Max(item.default_bom).as_("default_bom"),
+ 			Max(bom_item.bom_no).as_("line_bom_no"),
+-			bom_item.description.as_("description"),
+-			bom_item.stock_uom.as_("stock_uom"),
+-			item.min_order_qty.as_("min_order_qty"),
+-			item.safety_stock.as_("safety_stock"),
+-			item_default.default_warehouse,
+-			item.purchase_uom,
+-			item_uom.conversion_factor,
+-			bom.item.as_("main_bom_item"),
+-			bom.name.as_("main_bom"),
+-			bom_item.is_phantom_item,
++			Max(bom_item.description).as_("description"),
++			Max(bom_item.stock_uom).as_("stock_uom"),
++			Max(item.min_order_qty).as_("min_order_qty"),
++			Max(item.safety_stock).as_("safety_stock"),
++			Max(item_default.default_warehouse).as_("default_warehouse"),
++			Max(item.purchase_uom).as_("purchase_uom"),
++			Max(item_uom.conversion_factor).as_("conversion_factor"),
++			Max(bom.item).as_("main_bom_item"),
++			Max(bom.name).as_("main_bom"),
++			Max(bom_item.is_phantom_item).as_("is_phantom_item"),
+ 		)
+ 		.where(
+ 			(bom.name == bom_no)
+@@ -1727,7 +1730,8 @@ def get_subitems(
+ 			)
+ 		)
+ 		.groupby(bom_item.item_code)
+-		.orderby(bom_item.idx)
++		# idx is not grouped; Min() preserves the original ordering and is valid on postgres
++		.orderby(Min(bom_item.idx))
+ 	).run(as_dict=True)
+ 
+ 	for d in items:
+@@ -2797,23 +2801,26 @@ def get_raw_materials_of_sub_assembly_items(
+ 		.left_join(item_uom)
+ 		.on((item.name == item_uom.parent) & (item_uom.uom == item.purchase_uom))
+ 		.select(
++			# KNOWN LIMITATION: per-column max() can mix values from different BOM lines of the same
++			# item; to be reviewed
+ 			(IfNull(Sum(bei.stock_qty / IfNull(bom.quantity, 1)), 0) * planned_qty).as_("qty"),
+-			item.item_name,
+-			item.name.as_("item_code"),
+-			bei.description,
++			Max(item.item_name).as_("item_name"),
++			Max(item.name).as_("item_code"),
++			Max(bei.description).as_("description"),
++			Max(bei.source_warehouse).as_("source_warehouse"),
+ 			bei.stock_uom,
++			# bom_no / is_phantom_item are grouped as a pair (as in bom.py and develop) so that the pair
++			# always comes from one real BOM line
+ 			bei.is_phantom_item,
+ 			bei.bom_no,
+-			item.min_order_qty,
+-			bei.source_warehouse,
+-			item.default_material_request_type,
+-			item.min_order_qty,
+-			item_default.default_warehouse,
+-			item.purchase_uom,
+-			item_uom.conversion_factor,
+-			item.safety_stock,
+-			bom.item.as_("main_bom_item"),
+-			bom.name.as_("main_bom"),
++			Max(item.min_order_qty).as_("min_order_qty"),
++			Max(item.default_material_request_type).as_("default_material_request_type"),
++			Max(item_default.default_warehouse).as_("default_warehouse"),
++			Max(item.purchase_uom).as_("purchase_uom"),
++			Max(item_uom.conversion_factor).as_("conversion_factor"),
++			Max(item.safety_stock).as_("safety_stock"),
++			Max(bom.item).as_("main_bom_item"),
++			Max(bom.name).as_("main_bom"),
+ 		)
+ 		.where(
+ 			(bei.docstatus == 1)
+@@ -2824,7 +2831,7 @@ def get_raw_materials_of_sub_assembly_items(
+ 				| (bei.is_phantom_item == 1)
+ 			)
+ 		)
+-		.groupby(bei.item_code, bei.stock_uom)
++		.groupby(bei.item_code, bei.stock_uom, bei.bom_no, bei.is_phantom_item)
+ 	)
+ 
+ 	for item in query.run(as_dict=True):
+diff --git a/erpnext/manufacturing/doctype/work_order/work_order.py b/erpnext/manufacturing/doctype/work_order/work_order.py
+index 190fb91..ed06115 100644
+--- a/erpnext/manufacturing/doctype/work_order/work_order.py
++++ b/erpnext/manufacturing/doctype/work_order/work_order.py
+@@ -1137,6 +1137,7 @@ class WorkOrder(Document):
+ 		production_plan.flags.ignore_permissions = True
+ 		produced_qty = 0
+ 		if self.production_plan_item:
++			# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
+ 			total_qty = frappe.get_all(
+ 				"Work Order",
+ 				fields=[{"SUM": "produced_qty", "as": "produced_qty"}],
+@@ -1146,6 +1147,7 @@ class WorkOrder(Document):
+ 					"production_plan_item": self.production_plan_item,
+ 				},
+ 				as_list=1,
++				order_by=None,
+ 			)
+ 
+ 			produced_qty = total_qty[0][0] if total_qty else 0
+@@ -3552,7 +3554,10 @@ def get_disassembly_available_qty(stock_entry_name: str, current_se_name: str |
+ 	if current_se_name:
+ 		filters["name"] = ("!=", current_se_name)
+ 
+-	already_disassembled = flt(frappe.db.get_value("Stock Entry", filters, [{"SUM": "fg_completed_qty"}]))
++	# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
++	already_disassembled = flt(
++		frappe.db.get_value("Stock Entry", filters, [{"SUM": "fg_completed_qty"}], order_by=None)
++	)
+ 
+ 	return flt(
+ 		flt(se.fg_completed_qty) - already_disassembled,
+diff --git a/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py b/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
+index cc27424..ebac367 100644
+--- a/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
++++ b/erpnext/manufacturing/report/bom_stock_analysis/bom_stock_analysis.py
+@@ -5,7 +5,7 @@ import math
+ 
+ import frappe
+ from frappe import _
+-from frappe.query_builder.functions import IfNull, Max, Sum
++from frappe.query_builder.functions import IfNull, Max, Min, Sum
+ from frappe.utils import flt, fmt_money
+ from frappe.utils.data import comma_and
+ from pypika.terms import ExistsCriterion
+@@ -251,24 +251,53 @@ def get_bom_data(filters):
+ 		.on(bom_item.item_code == stock_qty.item_code)
+ 		.select(
+ 			bom_item.item_code,
+-			bom_item.description,
+-			bom_item.parent.as_("from_bom_no"),
++			# non-grouped columns are constant per grouped item_code -> Max() keeps the GROUP BY valid
++			# on postgres (parent is fixed by the where clause, so Max() returns that same BOM)
++			Max(bom_item.parent).as_("from_bom_no"),
+ 			Sum(bom_item.stock_qty).as_("bom_stock_qty"),
+ 			IfNull(Max(stock_qty.actual_qty), 0).as_("actual_qty"),
+ 		)
+ 		.where((bom_item.parent == filters.get("bom")) & (bom_item.parenttype == "BOM"))
+ 		.groupby(bom_item.item_code)
+-		.orderby(bom_item.idx)
++		# idx is not grouped, so postgres rejects ordering by it directly; idx is unique per
++		# BOM item, so Min() preserves the original ordering.
++		.orderby(Min(bom_item.idx))
+ 	)
+ 
+-	if bom_item_table == "BOM Item":
+-		query = query.select(bom_item.bom_no, bom_item.is_phantom_item)
+-
+ 	data = query.run(as_dict=True)
+ 	bom_quantity = flt(frappe.db.get_value("BOM", filters.get("bom"), "quantity")) or 1.0
+ 	for row in data:
+ 		row.qty_per_unit = flt(row.pop("bom_stock_qty")) / bom_quantity
+ 
++	# Same as develop: description belongs to a BOM line, not to the item, so a component listed more
++	# than once holds several values per group. Max() over text is a sort and the engines sort text
++	# differently (MariaDB folds case, PostgreSQL orders by byte value), so read it off one real line.
++	# For BOM Item that same line also supplies bom_no + is_phantom_item, which drive whether and
++	# which sub-BOM explode_phantom_boms recurses into and so must stay coherent with each other:
++	# the first line, upgraded to the first phantom line if any exists, so a phantom sub-BOM is never
++	# dropped just because a non-phantom line happens to be listed first.
++	fields = ["item_code", "description"]
++	if bom_item_table == "BOM Item":
++		fields += ["bom_no", "is_phantom_item"]
++
++	representative = {}
++	for line in frappe.get_all(
++		bom_item_table,
++		filters={"parent": filters.get("bom"), "parenttype": "BOM"},
++		fields=fields,
++		order_by="idx",
++	):
++		existing = representative.get(line.item_code)
++		if existing is None or (line.get("is_phantom_item") and not existing.get("is_phantom_item")):
++			representative[line.item_code] = line
++
++	for row in data:
++		line = representative.get(row.item_code)
++		row.description = line.description if line else None
++		if bom_item_table == "BOM Item":
++			row.bom_no = line.bom_no if line else None
++			row.is_phantom_item = line.is_phantom_item if line else None
++
+ 	return explode_phantom_boms(data, filters) if bom_item_table == "BOM Item" else data
+ 
+ 
+diff --git a/erpnext/manufacturing/report/process_loss_report/process_loss_report.py b/erpnext/manufacturing/report/process_loss_report/process_loss_report.py
+index 14e81c8..457b9cf 100644
+--- a/erpnext/manufacturing/report/process_loss_report/process_loss_report.py
++++ b/erpnext/manufacturing/report/process_loss_report/process_loss_report.py
+@@ -5,7 +5,7 @@
+ import frappe
+ from frappe import _
+ from frappe.query_builder import Case
+-from frappe.query_builder.functions import Coalesce, Sum
++from frappe.query_builder.functions import Coalesce, Max, Sum
+ 
+ from erpnext.accounts.report.utils import validate_date_range
+ 
+@@ -37,13 +37,15 @@ def get_data(filters: Filters) -> Data:
+ 		.left_join(finished_items)
+ 		.on(finished_items.stock_entry == se.name)
+ 		.select(
+-			wo.name,
+-			wo.status,
+-			wo.production_item,
++			# grouped by se.work_order (== wo.name); the work-order columns are constant per group ->
++			# Max() keeps the GROUP BY valid on postgres with the same value.
++			Max(wo.name).as_("name"),
++			Max(wo.status).as_("status"),
++			Max(wo.production_item).as_("production_item"),
+ 			Coalesce(Sum(finished_items.produced_qty), 0).as_("produced_qty"),
+ 			Coalesce(Sum(finished_items.output_qty), 0).as_("output_qty"),
+ 			Sum(se.process_loss_qty).as_("process_loss_qty"),
+-			wo.qty.as_("qty_to_manufacture"),
++			Max(wo.qty).as_("qty_to_manufacture"),
+ 			Sum(se.total_incoming_value).as_("total_fg_value"),
+ 			Sum(se.total_outgoing_value).as_("total_rm_value"),
+ 		)

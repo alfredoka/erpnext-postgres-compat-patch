@@ -1,0 +1,70 @@
+diff --git a/erpnext/projects/doctype/timesheet/timesheet.py b/erpnext/projects/doctype/timesheet/timesheet.py
+index 1668374..262e851 100644
+--- a/erpnext/projects/doctype/timesheet/timesheet.py
++++ b/erpnext/projects/doctype/timesheet/timesheet.py
+@@ -705,6 +705,11 @@ def get_timesheets_list(doctype, txt, filters, limit_start, limit_page_length=20
+ 		# Return timesheet related data to web portal.
+ 		table = frappe.qb.DocType("Timesheet")
+ 		child_table = frappe.qb.DocType("Timesheet Detail")
++		if frappe.db.db_type == "postgres":
++			# postgres rejects OR between two varchar columns; COALESCE returns the invoice itself
++			sales_invoice = Coalesce(table.sales_invoice, child_table.sales_invoice)
++		else:
++			sales_invoice = table.sales_invoice | child_table.sales_invoice
+ 		query = (
+ 			frappe.qb.from_(table)
+ 			.join(child_table)
+@@ -714,7 +719,7 @@ def get_timesheets_list(doctype, txt, filters, limit_start, limit_page_length=20
+ 				child_table.activity_type,
+ 				table.status,
+ 				child_table.billing_hours,
+-				(table.sales_invoice | child_table.sales_invoice).as_("sales_invoice"),
++				sales_invoice.as_("sales_invoice"),
+ 				child_table.project,
+ 			)
+ 			.where(table.docstatus == 1)
+diff --git a/erpnext/projects/report/daily_timesheet_summary/daily_timesheet_summary.py b/erpnext/projects/report/daily_timesheet_summary/daily_timesheet_summary.py
+index e5b80a6..2baa0dd 100644
+--- a/erpnext/projects/report/daily_timesheet_summary/daily_timesheet_summary.py
++++ b/erpnext/projects/report/daily_timesheet_summary/daily_timesheet_summary.py
+@@ -5,17 +5,25 @@
+ import frappe
+ from frappe import _
+ from frappe.desk.reportview import build_match_conditions
++from frappe.utils import add_days, getdate
+ 
+ from erpnext.accounts.report.utils import validate_date_range
++from erpnext.stock.utils import get_combine_datetime
+ 
+ 
+ def execute(filters=None):
+ 	validate_date_range(filters)
+ 	if not filters:
+ 		filters = {}
+-	elif filters.get("from_date") or filters.get("to_date"):
+-		filters["from_time"] = "00:00:00"
+-		filters["to_time"] = "24:00:00"
++	else:
++		# Combine date and time in Python, not with MySQL's TIMESTAMP(date, time) (absent on postgres);
++		# to_date runs to the end of that day, as TIMESTAMP(to_date, '24:00:00') did.
++		if filters.get("from_date"):
++			filters["from_datetime"] = get_combine_datetime(filters.get("from_date"), "00:00:00")
++		if filters.get("to_date"):
++			filters["to_datetime"] = get_combine_datetime(
++				add_days(getdate(filters.get("to_date")), 1), "00:00:00"
++			)
+ 
+ 	columns = get_column()
+ 	conditions = get_conditions(filters)
+@@ -57,9 +65,9 @@ def get_data(conditions, filters):
+ def get_conditions(filters):
+ 	conditions = "`tabTimesheet`.docstatus = 1"
+ 	if filters.get("from_date"):
+-		conditions += " and `tabTimesheet Detail`.from_time >= timestamp(%(from_date)s, %(from_time)s)"
++		conditions += " and `tabTimesheet Detail`.from_time >= %(from_datetime)s"
+ 	if filters.get("to_date"):
+-		conditions += " and `tabTimesheet Detail`.from_time < timestamp(%(to_date)s, %(to_time)s)"
++		conditions += " and `tabTimesheet Detail`.from_time < %(to_datetime)s"
+ 
+ 	match_conditions = build_match_conditions("Timesheet")
+ 	if match_conditions:

@@ -1,0 +1,113 @@
+diff --git a/erpnext/crm/report/lost_opportunity/lost_opportunity.py b/erpnext/crm/report/lost_opportunity/lost_opportunity.py
+index 090fe4e..92d9106 100644
+--- a/erpnext/crm/report/lost_opportunity/lost_opportunity.py
++++ b/erpnext/crm/report/lost_opportunity/lost_opportunity.py
+@@ -5,7 +5,7 @@
+ import frappe
+ from frappe import _
+ from frappe.query_builder import DocType
+-from frappe.query_builder.custom import GROUP_CONCAT
++from frappe.query_builder.functions import GroupConcat
+ from frappe.utils.nestedset import get_descendants_of
+ 
+ from erpnext.accounts.report.utils import validate_date_range
+@@ -76,6 +76,15 @@ def get_columns():
+ 
+ 
+ def get_data(filters):
++	# db-aware GROUP_CONCAT (MariaDB) / STRING_AGG (postgres) with a ", " separator; on Frappe 16
++	# GROUP_CONCAT takes the separator through .separator() and STRING_AGG as its second argument
++	if frappe.db.db_type == "postgres":
++		lost_reasons = GroupConcat(OpportunityLostReasonDetail.lost_reason, ", ", alias="lost_reason")
++	else:
++		lost_reasons = GroupConcat(OpportunityLostReasonDetail.lost_reason, alias="lost_reason").separator(
++			", "
++		)
++
+ 	query = (
+ 		frappe.qb.from_(Opportunity)
+ 		.left_join(OpportunityLostReasonDetail)
+@@ -89,7 +98,7 @@ def get_data(filters):
+ 			Opportunity.party_name,
+ 			Opportunity.customer_name,
+ 			Opportunity.opportunity_type,
+-			GROUP_CONCAT(OpportunityLostReasonDetail.lost_reason, alias="lost_reason").separator(", "),
++			lost_reasons,
+ 			Opportunity.sales_stage,
+ 			Opportunity.territory,
+ 		)
+diff --git a/erpnext/crm/report/sales_pipeline_analytics/sales_pipeline_analytics.py b/erpnext/crm/report/sales_pipeline_analytics/sales_pipeline_analytics.py
+index 4074a9f..400815b 100644
+--- a/erpnext/crm/report/sales_pipeline_analytics/sales_pipeline_analytics.py
++++ b/erpnext/crm/report/sales_pipeline_analytics/sales_pipeline_analytics.py
+@@ -8,8 +8,9 @@ from itertools import groupby
+ import frappe
+ from dateutil.relativedelta import relativedelta
+ from frappe import _
+-from frappe.query_builder.custom import Month, Quarter, Year
++from frappe.query_builder.functions import Extract
+ from frappe.utils import cint, flt, getdate
++from pypika.enums import DatePart
+ 
+ import erpnext
+ from erpnext.accounts.report.utils import validate_date_range
+@@ -81,8 +82,13 @@ class SalesPipelineAnalytics:
+ 
+ 		opp = frappe.qb.DocType("Opportunity")
+ 
+-		period_function = Month if self.filters.get("range") == "Monthly" else Quarter
+-		self.period_expressions = [Year(opp.expected_closing), period_function(opp.expected_closing)]
++		# EXTRACT instead of YEAR()/MONTH()/QUARTER(): postgres has no such functions, and EXTRACT
++		# returns the same numbers on MariaDB
++		period_part = DatePart.month if self.filters.get("range") == "Monthly" else DatePart.quarter
++		self.period_expressions = [
++			Extract(DatePart.year, opp.expected_closing),
++			Extract(period_part, opp.expected_closing),
++		]
+ 		self.period_fields = [
+ 			self.period_expressions[0].as_("year"),
+ 			self.period_expressions[1].as_("period"),
+@@ -98,20 +104,21 @@ class SalesPipelineAnalytics:
+ 		self.get_fields()
+ 
+ 		opp = frappe.qb.DocType("Opportunity")
+-		query = frappe.qb.get_query(
+-			"Opportunity",
+-			filters=self.get_conditions(),
+-			ignore_permissions=False,
+-		)
+-
+ 		pipeline_field = opp._assign if self.group_by_based_on == "_assign" else opp.sales_stage
+ 
+ 		if self.filters.get("based_on") == "Number":
++			# Ask get_query for exactly the grouped columns via `fields`, instead of taking its
++			# default un-grouped "name" select and stripping it.
+ 			self.query_result = (
+-				query.select(
+-					pipeline_field.as_(self.pipeline_by),
+-					frappe.query_builder.functions.Count("*").as_("count"),
+-					*self.period_fields,
++				frappe.qb.get_query(
++					"Opportunity",
++					filters=self.get_conditions(),
++					fields=[
++						pipeline_field.as_(self.pipeline_by),
++						frappe.query_builder.functions.Count("*").as_("count"),
++						*self.period_fields,
++					],
++					ignore_permissions=False,
+ 				)
+ 				.groupby(pipeline_field, *self.period_expressions)
+ 				.orderby(*self.period_expressions)
+@@ -120,6 +127,11 @@ class SalesPipelineAnalytics:
+ 			self.set_row_periods()
+ 
+ 		if self.filters.get("based_on") == "Amount":
++			query = frappe.qb.get_query(
++				"Opportunity",
++				filters=self.get_conditions(),
++				ignore_permissions=False,
++			)
+ 			self.query_result = query.select(
+ 				pipeline_field.as_(self.pipeline_by),
+ 				opp.opportunity_amount.as_("amount"),

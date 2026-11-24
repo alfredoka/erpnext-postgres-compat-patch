@@ -1,0 +1,110 @@
+diff --git a/erpnext/setup/doctype/company/company.py b/erpnext/setup/doctype/company/company.py
+index b61f072..993dc74 100644
+--- a/erpnext/setup/doctype/company/company.py
++++ b/erpnext/setup/doctype/company/company.py
+@@ -13,6 +13,7 @@ from frappe.custom.doctype.property_setter.property_setter import make_property_
+ from frappe.desk.page.setup_wizard.setup_wizard import make_records
+ from frappe.utils import (
+ 	add_months,
++	add_years,
+ 	cint,
+ 	formatdate,
+ 	get_first_day,
+@@ -1129,12 +1130,13 @@ def get_all_transactions_annual_history(company):
+ 		where
+ 			company=%s
+ 			and
+-			transaction_date > date_sub(curdate(), interval 1 year)
++			transaction_date > %s
+ 
+ 		group by
+ 			transaction_date
+ 			""",
+-		(company),
++		# the cutoff is computed here: date_sub()/curdate() are MariaDB-only
++		(company, add_years(today(), -1)),
+ 		as_dict=True,
+ 	)
+ 
+diff --git a/erpnext/setup/doctype/email_digest/email_digest.py b/erpnext/setup/doctype/email_digest/email_digest.py
+index a6f0522..f4ee800 100644
+--- a/erpnext/setup/doctype/email_digest/email_digest.py
++++ b/erpnext/setup/doctype/email_digest/email_digest.py
+@@ -183,9 +183,10 @@ class EmailDigest(Document):
+ 			if not frappe.has_permission(doctype, "read"):
+ 				return False
+ 			filters = {"company": self.company}
+-			visible = frappe.get_list(doctype, filters=filters, fields=[{"COUNT": "*", "as": "count"}])[
+-				0
+-			].count
++			# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
++			visible = frappe.get_list(
++				doctype, filters=filters, fields=[{"COUNT": "*", "as": "count"}], order_by=None
++			)[0].count
+ 			if visible != frappe.db.count(doctype, filters):
+ 				return False
+ 		return True
+@@ -345,8 +346,12 @@ class EmailDigest(Document):
+ 		"""Get count of Issue"""
+ 		if not frappe.has_permission("Issue", "read"):
+ 			return 0
++		# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
+ 		return frappe.get_list(
+-			"Issue", filters={"status": ["in", ["Open", "Replied"]]}, fields=[{"COUNT": "*", "as": "count"}]
++			"Issue",
++			filters={"status": ["in", ["Open", "Replied"]]},
++			fields=[{"COUNT": "*", "as": "count"}],
++			order_by=None,
+ 		)[0].count
+ 
+ 	def get_project_list(self, user_id=None):
+@@ -375,10 +380,12 @@ class EmailDigest(Document):
+ 		"""Get count of Project"""
+ 		if not frappe.has_permission("Project", "read"):
+ 			return 0
++		# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
+ 		return frappe.get_list(
+ 			"Project",
+ 			filters={"status": "Open", "project_type": "External"},
+ 			fields=[{"COUNT": "*", "as": "count"}],
++			order_by=None,
+ 		)[0].count
+ 
+ 	def set_accounting_cards(self, context):
+@@ -930,6 +937,7 @@ class EmailDigest(Document):
+ 			"posting_date" if doc_type in ["Sales Invoice", "Purchase Invoice"] else "transaction_date"
+ 		)
+ 
++		# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
+ 		return frappe.get_all(
+ 			doc_type,
+ 			filters={
+@@ -939,6 +947,7 @@ class EmailDigest(Document):
+ 				"company": self.company,
+ 			},
+ 			fields=[{"COUNT": "*", "as": "count"}, {"SUM": "base_grand_total", "as": "grand_total"}],
++			order_by=None,
+ 		)
+ 
+ 	def get_from_to_date(self):
+diff --git a/erpnext/setup/doctype/sales_person/sales_person.py b/erpnext/setup/doctype/sales_person/sales_person.py
+index 2f4916a..8f244c2 100644
+--- a/erpnext/setup/doctype/sales_person/sales_person.py
++++ b/erpnext/setup/doctype/sales_person/sales_person.py
+@@ -67,6 +67,8 @@ class SalesPerson(NestedSet):
+ 				"Sales Team",
+ 				{"docstatus": 1, "parenttype": "Sales Order", "sales_person": self.sales_person_name},
+ 				[{"SUM": "allocated_amount"}],
++				# the default ORDER BY creation next to an aggregate is a GroupingError on postgres
++				order_by=None,
+ 			)
+ 		)
+ 
+@@ -75,6 +77,7 @@ class SalesPerson(NestedSet):
+ 				"Sales Team",
+ 				{"docstatus": 1, "parenttype": "Sales Invoice", "sales_person": self.sales_person_name},
+ 				[{"SUM": "allocated_amount"}],
++				order_by=None,
+ 			)
+ 		)
+ 

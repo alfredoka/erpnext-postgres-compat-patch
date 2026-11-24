@@ -1,0 +1,45 @@
+diff --git a/erpnext/erpnext_integrations/doctype/plaid_settings/plaid_settings.py b/erpnext/erpnext_integrations/doctype/plaid_settings/plaid_settings.py
+index 38a97d3..c9be72f 100644
+--- a/erpnext/erpnext_integrations/doctype/plaid_settings/plaid_settings.py
++++ b/erpnext/erpnext_integrations/doctype/plaid_settings/plaid_settings.py
+@@ -117,6 +117,8 @@ def add_bank_accounts(response, bank, company):
+ 
+ 		if not existing_bank_account:
+ 			try:
++				# savepoint so a failed insert doesn't poison the transaction on postgres
++				frappe.db.savepoint("plaid_bank_account")
+ 				gl_account = frappe.get_doc(
+ 					{
+ 						"doctype": "Account",
+@@ -146,12 +148,14 @@ def add_bank_accounts(response, bank, company):
+ 
+ 				result.append(new_account.name)
+ 			except frappe.UniqueValidationError:
++				frappe.db.rollback(save_point="plaid_bank_account")  # preserve transaction in postgres
+ 				frappe.msgprint(
+ 					_("Bank account {0} already exists and could not be created again").format(
+ 						account["name"]
+ 					)
+ 				)
+ 			except Exception:
++				frappe.db.rollback(save_point="plaid_bank_account")  # preserve transaction in postgres
+ 				frappe.log_error("Plaid Link Error")
+ 				frappe.throw(
+ 					_("There was an error creating Bank Account while linking with Plaid."),
+@@ -159,6 +163,8 @@ def add_bank_accounts(response, bank, company):
+ 				)
+ 
+ 		else:
++			# savepoint so a failed save doesn't poison the transaction on postgres (as develop)
++			frappe.db.savepoint("plaid_update_account")
+ 			try:
+ 				existing_account = frappe.get_doc("Bank Account", existing_bank_account)
+ 				existing_account.update(
+@@ -174,6 +180,7 @@ def add_bank_accounts(response, bank, company):
+ 				existing_account.save()
+ 				result.append(existing_bank_account)
+ 			except Exception:
++				frappe.db.rollback(save_point="plaid_update_account")  # preserve transaction in postgres
+ 				frappe.log_error("Plaid Link Error")
+ 				frappe.throw(
+ 					_("There was an error updating Bank Account {} while linking with Plaid.").format(

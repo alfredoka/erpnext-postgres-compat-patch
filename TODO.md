@@ -62,6 +62,11 @@ also `patches/v13_0/*`, `setup/doctype/company/company.py`,
 `accounts/doctype/loyalty_point_entry/loyalty_point_entry.py` (some of these
 may also be audit-tool false positives, not re-checked since out of scope).
 
+v16.60.0 (item 6): these areas were re-audited for the new set. `production_plan`
+and `stock_entry` are fixed there; the `loyalty_point_entry.py` and
+`company.py` hits turned out to be audit false positives. None of it is
+back-ported to the v16.33.0 set (item 12).
+
 ## 2. `manufacturing/doctype/bom/bom.py` needs to be redone [DONE 2026-08-29]
 
 The hand-written fix wrapped ~15 non-grouped columns in independent `max()`
@@ -84,6 +89,16 @@ filtered to one BOM) and `process_loss_report.py` (wraps six Work Order
 columns grouped by `work_order` — safe, all six are attributes of one WO
 document row per group, no correlation risk). Neither needed changes.
 (No `pick_list.py` fix exists in this patch set — nothing to check there.)
+
+Correction (2026-11-23, found while porting to v16.60.0): the `bom_no`/
+`is_phantom_item` part is right, but `get_bom_items_as_dict` in the v16.33.0
+set still fails on PostgreSQL for two other reasons — unqualified `GROUP BY`
+names (`item_code`, `stock_uom`) that are ambiguous across the joined tables,
+and `or bom_item.is_phantom_item` on a smallint. Confirmed by running the
+v16.33.0 query on PostgreSQL (on the v16.60.0 schema; neither error depends on
+it). By analysis, not by a run, the same query also fails on MariaDB
+("Can't group on 'stock_uom'"). Not fixed in v16.33.0 (item 12); fixed in
+v16.60.0.
 
 ## 3. Push to GitHub [DONE 2026-08-29]
 
@@ -184,3 +199,150 @@ of an accounting-only deployment, not checked live:
 `manufacturing/doctype/work_order/work_order.py:2740`,
 `setup/doctype/sales_person/sales_person.py:64,72`,
 `accounts/report/item_wise_sales_register/item_wise_sales_register.py:524`.
+v16.60.0: the first four get `order_by=None` in the new set; the
+`item_wise_sales_register` one is dead code there (nothing calls it).
+
+## 6. Port to v16.60.0 [DONE 2026-11-23 — patch set built and tested locally; image and deployment: item 11]
+
+Why: the official `frappe/erpnext:v16.60.0` image ships `pg_dump` 17, so
+`bench backup` works against PostgreSQL 17 (the v16.33.0 image ships 15 and
+fails). Unpatched, v16.60.0 breaks the same accounting paths as v16.33.0, and
+`bench migrate` from v16.33.0 stops on
+`set_outstanding_for_zero_portion_payment_terms` (`UPDATE ... JOIN`).
+
+Done:
+
+- `patches/v16.60.0/`: 16 per-module patches, 80 files,
+  249 hunks. The 42 v16.33.0 hunks that no longer applied were redone
+  against v16.60.0, the 106 that applied with reduced context were checked one
+  by one, the migration patch was fixed, and v16.60.0 was audited for new
+  failing queries (README, "v16.60.0").
+- Dropped from the v16.33.0 set: hunks upstream already fixed, the partial
+  indexes (not recreated), the advisory lock and the repost gate helpers.
+- Strict `apply.sh v16.60.0` on a clean v16.60.0 checkout gives a tree
+  byte-identical to the curated one.
+- Local Docker stack, from a copy of a patched v16.33.0 site with a closed year:
+  `bench migrate` without `--skip-failing`, accounting verification identical to
+  the cent, Journal Entry / Period Closing Voucher writes with rollback,
+  searches, `bench backup`, UI, and a pass over 179 script reports. The
+  failures that pass found were fixed or explained (README).
+- Full rerun with the final patch set, from a fresh copy of the v16.33.0
+  database (2026-11-23): all of the above pass; 136 of the 179 reports run
+  clean, the 5 SQL failures are the 4 generic-filter cases and Financial Ratios.
+
+Pending:
+
+- The paths README lists under "Not run against a database" (`REGEXP` as `~`,
+  Payment Entry, Sales Payment Summary in both modes, Repost Item Valuation,
+  the non-legacy period-closing controller, …) and the 38 reports the generic
+  filters did not reach: exercise them with real filters and data.
+
+## 7. Date filters at boundary hours [OPEN]
+
+In the v16.60.0 set, "today" on PostgreSQL is the app's `nowdate()` passed as a
+parameter, not the database server's `CURRENT_DATE`: Frappe stores dates in the
+system time zone but does not set the PostgreSQL session time zone, so on a
+server in UTC `CURRENT_DATE` runs a day ahead in the late evening west of UTC.
+Only simulated so far (by moving the session time zone inside a rolled-back
+transaction). Test with real clocks around 23:00 and midnight app time:
+
+- Inactive Sales Items, Inactive Customers, Sales Order Analysis (day counts);
+- `accounts/utils.get_held_invoices` (Payment Entry *Get Outstanding
+  Invoices*, Payment Reconciliation for suppliers) against its complement,
+  `payment_entry.get_negative_outstanding_invoices`, which keeps upstream's
+  `release_date <= CURRENT_DATE` (valid SQL, not patched; `develop` passes the
+  date as a parameter) — the two can disagree in that window;
+- company transaction history and the activation level (cut-offs now computed
+  from the app's date);
+- the "last year" activity charts that use Frappe's `CurDate()`
+  (`sales_person.py`, `project.py`, `item.py`): database date, low impact, not
+  changed.
+
+## 8. Review per-column `max()` in `bom.py` and `production_plan.py` [OPEN]
+
+`bom.get_bom_items_as_dict` and the three Production Plan queries
+(`get_exploded_items`, `get_subitems`,
+`get_raw_materials_of_sub_assembly_items`) use an independent `max()` per
+non-grouped column, by decision, with a `KNOWN LIMITATION` comment in the code.
+The `bom_no`/`is_phantom_item` pair is the exception: BOM and the sub-assembly
+query group by it (as `develop` does), because an invented pair made the
+sub-assembly explosion silently wrong (owner's decision, 2026-11-23).
+With an item repeated on several lines of one group, columns can come from
+different lines (`uom` with another line's `conversion_factor`;
+`description`/`source_warehouse`; in `get_subitems`, `bom_no` with another
+line's `is_phantom_item`), and `max()` over
+text follows each engine's collation. Quantities are sums and are fine.
+
+Options already looked at: representative lines (first line by `idx`, as
+`develop` does; drafted and then replaced by `max()`), adding `uom`/
+`conversion_factor` to the `GROUP BY` (splits groups, changes MariaDB results),
+`Min(is_phantom_item)` as `develop` does in `get_subitems`. Test case: a BOM that
+repeats an item with different `uom`, warehouse or phantom flag.
+
+## 9. Financial Ratios: `account in ()` [OPEN, upstream]
+
+`accounts/utils.get_balance_on(account_type=...)` builds `gle.account in ()`
+when the company has no leaf account of that type (Receivable, Payable, Stock),
+which is a syntax error on MariaDB as well, so Financial Ratios fails on any such
+company. Same code on `develop`. Not touched: the obvious fix
+(`if not accounts: return 0.0`) turns an error into 0 on MariaDB too. Worth
+reporting upstream.
+
+## 10. Home workspace charts on v16.60.0 [DONE 2026-11-23 — not a PostgreSQL issue]
+
+"Bank Balance" ("Invalid expression set in filter account") and "Profit and
+Loss" ("Start Year and End Year are mandatory") on the new Home workspace fail
+when the site has no default company or no Fiscal Year covering today. Same on
+unpatched v16.60.0 and on MariaDB; site configuration fixes it. Noted in the
+README; nothing for the patch.
+
+## 11. Image and deployment of v16.60.0 [NOT STARTED]
+
+No image has been built from `patches/v16.60.0/` and nothing is deployed; that
+is decided separately. When it is: apply the patch in the image before
+`bench migrate`, and review any script that relies on the v16.33.0
+period-closing behaviour (README, "Upgrading from v16.33.0").
+
+## 12. v16.33.0 known problems [WON'T FIX]
+
+Decision of the owner: the v16.33.0 set stays as it is (its production site
+only uses accounting); v16.60.0 covers all of these. Listed in the README
+("Known problems (not fixed)"):
+
+- the partial indexes (`add_index(..., where=..., include=...)`) **that this
+  patch adds** to GL Entry, Stock Ledger Entry and Serial and Batch Bundle
+  break `bench new-site` and any `bench migrate` that re-imports those doctypes
+  (Frappe 16.31.0's `add_index` takes no `where`/`include`). Earlier notes blamed
+  ERPNext 16.33.0; plain v16.33.0 makes no such call;
+- stock: `update_qty_in_future_sle` assigns `qty_after_transaction` twice;
+  `transaction_advisory_lock` does not exist in Frappe 16.31.0;
+  `deprecated_serial_batch` still mixes `FOR UPDATE` and `GROUP BY`;
+- BOM explosion (item 2), Budget Variance (`MONTHNAME`), Supplier Scorecard
+  (`DATEDIFF`), `stock_balance` reserved quantity (`if()`), Payment Entry
+  `before_save` with references, returns, and the Item link search.
+
+## 13. Found while porting, not fixed [OPEN, low priority]
+
+Not errors on the paths exercised, or not PostgreSQL issues; listed so they are
+not rediscovered:
+
+- `accounts/utils.fix_total_debit_credit`: `UPDATE ... LIMIT 1`, invalid on
+  PostgreSQL; a console helper with no callers (`develop` rewrote it).
+- Divisions by `conversion_factor` that PostgreSQL would reject if it were 0
+  (`status_updater.py`, `budget.py`, `budget_controller.py`,
+  `non_billed_report.py`): the field is mandatory and validated non-zero.
+- Frappe 16.60.2 drops `ORDER BY` from `get_all` with `group_by`/`distinct` on
+  PostgreSQL: `journal_entry.get_against_jv` and the Purchase Receipt /
+  Purchase Invoice / Blanket Order link searches lose their order (no error).
+- `account.py:_ensure_idle_system`: `get_value(..., for_update=True)` does not
+  block inserts on PostgreSQL (`develop` takes a table lock). Matters only for
+  concurrent writes while renaming or merging an account.
+- Case-insensitive serial-number matching that `develop` adds with `Lower()`
+  (`deprecated_serial_batch.get_last_inward_sle_for_serial_no`,
+  `stock_ledger.get_incoming_value_for_serial_nos`): only differs for serial
+  numbers written with different case, on old entries.
+- `get_held_invoices` keeps v16.60.0's behaviour (no filter by supplier,
+  invoices on hold without a release date excluded); `develop` changed both.
+- Upstream, not PostgreSQL: `controllers/item_variant.get_variant` passes
+  `use_template_image` to `find_variant`, so the "variant already exists" warning
+  never fires when the template has an image.

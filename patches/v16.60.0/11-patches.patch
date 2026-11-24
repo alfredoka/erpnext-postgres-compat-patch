@@ -1,0 +1,41 @@
+diff --git a/erpnext/patches/v16_0/set_outstanding_for_zero_portion_payment_terms.py b/erpnext/patches/v16_0/set_outstanding_for_zero_portion_payment_terms.py
+index 6bc9a9a..997d0e0 100644
+--- a/erpnext/patches/v16_0/set_outstanding_for_zero_portion_payment_terms.py
++++ b/erpnext/patches/v16_0/set_outstanding_for_zero_portion_payment_terms.py
+@@ -8,19 +8,25 @@ def execute():
+ 		parent = DocType(parenttype)
+ 		settled = ps.paid_amount + ps.discounted_amount
+ 		outstanding = ps.payment_amount - settled
++		conditions = (
++			(ps.parenttype == parenttype)
++			& (parent.docstatus == 1)
++			& (ps.invoice_portion == 0)
++			& (ps.outstanding == 0)
++			& (settled < ps.payment_amount)
++		)
++
++		query = frappe.qb.update(ps)
++		if frappe.db.db_type == "postgres":
++			# Postgres has no UPDATE ... JOIN: join the parent through UPDATE ... FROM instead
++			query = query.from_(parent)
++			conditions = (ps.parent == parent.name) & conditions
++		else:
++			query = query.join(parent).on(ps.parent == parent.name)
+ 
+ 		(
+-			frappe.qb.update(ps)
+-			.join(parent)
+-			.on(ps.parent == parent.name)
+-			.set(ps.outstanding, outstanding)
++			query.set(ps.outstanding, outstanding)
+ 			.set(ps.base_payment_amount, ps.payment_amount * parent.conversion_rate)
+ 			.set(ps.base_outstanding, outstanding * parent.conversion_rate)
+-			.where(
+-				(ps.parenttype == parenttype)
+-				& (parent.docstatus == 1)
+-				& (ps.invoice_portion == 0)
+-				& (ps.outstanding == 0)
+-				& (settled < ps.payment_amount)
+-			)
++			.where(conditions)
+ 		).run()

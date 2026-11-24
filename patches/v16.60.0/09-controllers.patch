@@ -1,0 +1,298 @@
+diff --git a/erpnext/controllers/accounts_controller.py b/erpnext/controllers/accounts_controller.py
+index dec7923..51ae3cc 100644
+--- a/erpnext/controllers/accounts_controller.py
++++ b/erpnext/controllers/accounts_controller.py
+@@ -14,7 +14,7 @@ from frappe.model.document import Document
+ from frappe.model.workflow import get_workflow_name
+ from frappe.query_builder import Criterion, DocType
+ from frappe.query_builder.custom import ConstantColumn
+-from frappe.query_builder.functions import Abs, IfNull, Sum
++from frappe.query_builder.functions import Abs, IfNull, Max, Sum
+ from frappe.utils import (
+ 	DateTimeLikeObject,
+ 	add_days,
+@@ -2650,7 +2650,7 @@ class AccountsController(TransactionBase):
+ 		adv = frappe.qb.DocType("Advance Payment Ledger Entry")
+ 		return (
+ 			qb.from_(adv)
+-			.select(Abs(Sum(adv.amount)).as_("amount"), adv.currency.as_("account_currency"))
++			.select(Abs(Sum(adv.amount)).as_("amount"), Max(adv.currency).as_("account_currency"))
+ 			.where(adv.company == self.company)
+ 			.where(adv.delinked == 0)
+ 			.where(adv.against_voucher_type == self.doctype)
+@@ -2679,6 +2679,7 @@ class AccountsController(TransactionBase):
+ 		new_status = None
+ 
+ 		PaymentRequest = frappe.qb.DocType("Payment Request")
++		# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
+ 		requested_paid_amount = frappe.get_value(
+ 			doctype="Payment Request",
+ 			filters={
+@@ -2687,6 +2688,7 @@ class AccountsController(TransactionBase):
+ 				"docstatus": 1,
+ 			},
+ 			fieldname=Sum(PaymentRequest.grand_total - PaymentRequest.outstanding_amount),
++			order_by=None,
+ 		)
+ 
+ 		advance_paid = flt(self.get("advance_paid"))
+@@ -4192,13 +4194,13 @@ def update_invoice_status():
+ 
+ 		total = (
+ 			frappe.qb.terms.Case()
+-			.when(invoice.disable_rounded_total, invoice.grand_total)
++			.when(invoice.disable_rounded_total == 1, invoice.grand_total)
+ 			.else_(invoice.rounded_total)
+ 		)
+ 
+ 		base_total = (
+ 			frappe.qb.terms.Case()
+-			.when(invoice.disable_rounded_total, invoice.base_grand_total)
++			.when(invoice.disable_rounded_total == 1, invoice.base_grand_total)
+ 			.else_(invoice.base_rounded_total)
+ 		)
+ 
+@@ -4211,7 +4213,7 @@ def update_invoice_status():
+ 			& (invoice.outstanding_amount > 0)
+ 			& (invoice.status.like("Unpaid%") | invoice.status.like("Partly Paid%"))
+ 			& (
+-				((invoice.is_pos & invoice.due_date < today) | is_overdue)
++				(((invoice.is_pos == 1) & (invoice.due_date < today)) | is_overdue)
+ 				if doctype == "Sales Invoice"
+ 				else is_overdue
+ 			)
+diff --git a/erpnext/controllers/item_variant.py b/erpnext/controllers/item_variant.py
+index 1c43703..9416014 100644
+--- a/erpnext/controllers/item_variant.py
++++ b/erpnext/controllers/item_variant.py
+@@ -207,13 +207,17 @@ def update_variant_attribute_values(item_attribute):
+ 	for old_value, new_value in value_map.items():
+ 		attribute_value_case = attribute_value_case.when(attribute_value == old_value, new_value)
+ 
++	# Postgres has no UPDATE ... JOIN; restrict to variant items via a subquery on the parent instead.
++	variant_items = (
++		frappe.qb.from_(item_table)
++		.select(item_table.name)
++		.where(item_table.variant_of.isnotnull())
++		.where(item_table.variant_of != "")
++	)
+ 	(
+ 		frappe.qb.update(item_variant_table)
+-		.join(item_table)
+-		.on(item_table.name == item_variant_table.parent)
+ 		.set(attribute_value, attribute_value_case.else_(attribute_value))
+-		.where(item_table.variant_of.isnotnull())
+-		.where(item_table.variant_of != "")
++		.where(item_variant_table.parent.isin(variant_items))
+ 		.where(item_variant_table.attribute == item_attribute.name)
+ 		.where(attribute_value.isin(list(value_map)))
+ 	).run()
+diff --git a/erpnext/controllers/queries.py b/erpnext/controllers/queries.py
+index 68d9687..429b9e8 100644
+--- a/erpnext/controllers/queries.py
++++ b/erpnext/controllers/queries.py
+@@ -10,7 +10,7 @@ from frappe import _, qb
+ from frappe.desk.reportview import get_filters_cond, get_match_cond
+ from frappe.permissions import has_permission
+ from frappe.query_builder import Case, Criterion, DocType
+-from frappe.query_builder.functions import Concat, Locate, Lower, Sum
++from frappe.query_builder.functions import Cast_, Concat, Locate, Lower, Sum
+ from frappe.query_builder.terms import NamedParameterWrapper
+ from frappe.utils import cint, nowdate, today, unique
+ from pypika import Order
+@@ -266,8 +266,10 @@ def item_query(
+ 		columns += ", " + ", ".join(extra_searchfields)
+ 
+ 	if "description" in searchfields:
+-		columns += """, if(length(tabItem.description) > 40, \
+-			concat(substr(tabItem.description, 1, 40), "..."), description) as description"""
++		# CASE and '...' instead of IF() and "...": postgres has no IF() and reads "..." as an identifier;
++		# `tabItem` is backquoted so postgres does not fold it to an unknown "tabitem" table
++		columns += """, case when length(`tabItem`.description) > 40 \
++			then concat(substr(`tabItem`.description, 1, 40), '...') else description end as description"""
+ 
+ 	searchfields = searchfields + [
+ 		field
+@@ -307,7 +309,7 @@ def item_query(
+ 	description_cond = ""
+ 	if frappe.db.estimate_count(doctype) < 50000:
+ 		# scan description only if items are less than 50000
+-		description_cond = "or tabItem.description LIKE %(txt)s"
++		description_cond = "or `tabItem`.description LIKE %(txt)s"
+ 		searched_fields.append("description")
+ 
+ 	candidate_cond = ""
+@@ -316,27 +318,34 @@ def item_query(
+ 		if not candidates:
+ 			return [] if as_dict else ()
+ 
+-		candidate_cond = "and tabItem.name in %(candidates)s"
++		candidate_cond = "and `tabItem`.name in %(candidates)s"
+ 
++	# '0000-00-00' is not a valid date on postgres (casting it raises), so there only NULL counts as unset
++	no_end_of_life_cond = "ifnull(`tabItem`.end_of_life, '0000-00-00')='0000-00-00'"
++	if frappe.db.db_type == "postgres":
++		no_end_of_life_cond = "`tabItem`.end_of_life is null"
++
++	# postgres: CASE instead of IF(), LIMIT ... OFFSET instead of LIMIT a, b
+ 	# nosemgrep: frappe-semgrep-rules.rules.security.frappe-sql-format-injection
+ 	return frappe.db.sql(
+ 		"""select
+-			tabItem.name {columns}
++			`tabItem`.name {columns}
+ 		from tabItem
+-		where tabItem.docstatus < 2
+-			and tabItem.disabled=0
+-			and tabItem.has_variants=0
+-			and (tabItem.end_of_life > %(today)s or ifnull(tabItem.end_of_life, '0000-00-00')='0000-00-00')
+-			and ({scond} or tabItem.item_code IN (select parent from `tabItem Barcode` where barcode LIKE %(txt)s)
++		where `tabItem`.docstatus < 2
++			and `tabItem`.disabled=0
++			and `tabItem`.has_variants=0
++			and (`tabItem`.end_of_life > %(today)s or {no_end_of_life_cond})
++			and ({scond} or `tabItem`.item_code IN (select parent from `tabItem Barcode` where barcode LIKE %(txt)s)
+ 				{description_cond})
+ 			{fcond} {mcond} {candidate_cond} {allowed_items_cond} {company_cond}
+ 		order by
+-			if(locate(%(_txt)s, name), locate(%(_txt)s, name), 99999),
+-			if(locate(%(_txt)s, item_name), locate(%(_txt)s, item_name), 99999),
++			case when locate(%(_txt)s, name) > 0 then locate(%(_txt)s, name) else 99999 end,
++			case when locate(%(_txt)s, item_name) > 0 then locate(%(_txt)s, item_name) else 99999 end,
+ 			idx desc,
+ 			name, item_name
+-		limit %(start)s, %(page_len)s """.format(
++		limit %(page_len)s offset %(start)s """.format(
+ 			columns=columns,
++			no_end_of_life_cond=no_end_of_life_cond,
+ 			scond=searchfields,
+ 			fcond=get_filters_cond(doctype, filters, conditions).replace("%", "%%"),
+ 			mcond=get_match_cond(doctype),
+@@ -366,7 +375,7 @@ def get_allowed_items_cond(party_type, party):
+ 
+ 	item = frappe.qb.DocType("Item")
+ 	allowed_items = frappe.qb.from_(item).select(item.name).where(allowed_items_condition)
+-	return f"and tabItem.name in ({allowed_items})"
++	return f"and `tabItem`.name in ({allowed_items})"
+ 
+ 
+ @frappe.whitelist()
+@@ -618,7 +627,8 @@ def get_batches_from_stock_ledger_entries(searchfields, txt, filters, start=0, p
+ 			& (batch_table.disabled == 0)
+ 			& (stock_ledger_entry.batch_no.isnotnull())
+ 		)
+-		.groupby(stock_ledger_entry.batch_no, stock_ledger_entry.warehouse)
++		# batch_table.name (= batch_no) lets postgres accept the Batch columns selected below
++		.groupby(stock_ledger_entry.batch_no, stock_ledger_entry.warehouse, batch_table.name)
+ 		.having(Sum(stock_ledger_entry.actual_qty) != 0)
+ 		.offset(start)
+ 		.limit(page_len)
+@@ -678,7 +688,8 @@ def get_batches_from_serial_and_batch_bundle(searchfields, txt, filters, start=0
+ 			& (batch_table.disabled == 0)
+ 			& (stock_ledger_entry.serial_and_batch_bundle.isnotnull())
+ 		)
+-		.groupby(bundle.batch_no, bundle.warehouse)
++		# batch_table.name (= batch_no) lets postgres accept the Batch columns selected below
++		.groupby(bundle.batch_no, bundle.warehouse, batch_table.name)
+ 		.having(Sum(bundle.qty) != 0)
+ 		.offset(start)
+ 		.limit(page_len)
+@@ -839,7 +850,10 @@ def get_filtered_dimensions(doctype, txt, searchfield, start, page_len, filters,
+ 		query_filters.append(["company", "=", filters.get("company")])
+ 
+ 	for field in searchfields:
+-		or_filters.append([field, "LIKE", "%%%s%%" % txt])
++		# no LIKE on Check fields (e.g. Cost Center's is_group): postgres has no LIKE for smallint
++		df = meta.get_field(field)
++		if not df or df.fieldtype != "Check":
++			or_filters.append([field, "LIKE", "%%%s%%" % txt])
+ 		fields.append(field)
+ 
+ 	if dimension_filters:
+@@ -1231,7 +1245,9 @@ def get_filtered_child_rows(doctype, txt, searchfield, start, page_len, filters)
+ 	if txt:
+ 		txt += "%"
+ 		query = query.where(
+-			((table.idx.like(txt.replace("#", ""))) | (table.item_code.like(txt))) | (table.name.like(txt))
++			# idx is an integer: cast it, postgres has no LIKE for integers
++			((Cast_(table.idx, "varchar").like(txt.replace("#", ""))) | (table.item_code.like(txt)))
++			| (table.name.like(txt))
+ 		)
+ 
+ 	return query.run(as_dict=False)
+diff --git a/erpnext/controllers/sales_and_purchase_return.py b/erpnext/controllers/sales_and_purchase_return.py
+index 836c271..784a88d 100644
+--- a/erpnext/controllers/sales_and_purchase_return.py
++++ b/erpnext/controllers/sales_and_purchase_return.py
+@@ -582,6 +582,7 @@ def get_returned_qty_map_for_row(return_against, party, row_name, doctype):
+ 			]
+ 
+ 	# Used retrun against and supplier and is_retrun because there is an index added for it
++	# order_by=None: the default ORDER BY creation next to the aggregates is a GroupingError on postgres
+ 	data = frappe.get_all(
+ 		doctype,
+ 		fields=fields,
+@@ -592,6 +593,7 @@ def get_returned_qty_map_for_row(return_against, party, row_name, doctype):
+ 			[doctype, "is_return", "=", 1],
+ 			[child_doctype, reference_field, "=", row_name],
+ 		],
++		order_by=None,
+ 	)
+ 
+ 	return data[0]
+diff --git a/erpnext/controllers/stock_controller.py b/erpnext/controllers/stock_controller.py
+index d7a19fc..6b0db33 100644
+--- a/erpnext/controllers/stock_controller.py
++++ b/erpnext/controllers/stock_controller.py
+@@ -8,7 +8,7 @@ import frappe
+ from frappe import _, bold
+ from frappe.model.utils.mask import mask_dict_results
+ from frappe.query_builder import Criterion
+-from frappe.query_builder.functions import Count, Min, Sum
++from frappe.query_builder.functions import Count, Max, Min, Sum
+ from frappe.utils import cint, cstr, flt, get_link_to_form, getdate
+ 
+ import erpnext
+@@ -1418,7 +1418,7 @@ class StockController(AccountsController):
+ 			lcv_item = frappe.qb.DocType("Landed Cost Item")
+ 			query = (
+ 				frappe.qb.from_(lcv_item)
+-				.select(Sum(lcv_item.applicable_charges), lcv_item.cost_center)
++				.select(Sum(lcv_item.applicable_charges), Max(lcv_item.cost_center))
+ 				.where((lcv_item.docstatus == 1) & (lcv_item.receipt_document == self.name))
+ 			)
+ 
+diff --git a/erpnext/controllers/subcontracting_inward_controller.py b/erpnext/controllers/subcontracting_inward_controller.py
+index b857b8b..e966c39 100644
+--- a/erpnext/controllers/subcontracting_inward_controller.py
++++ b/erpnext/controllers/subcontracting_inward_controller.py
+@@ -534,23 +534,16 @@ class SubcontractingInwardController:
+ 					)
+ 				)
+ 
+-			from pypika.terms import ValueWrapper
+-
+ 			table = frappe.qb.DocType("Subcontracting Inward Order Item")
++			# Apply the Check setting in Python: `... OR 0/1` inside the CASE is an integer, not a
++			# boolean, and postgres rejects it ("argument of OR must be type boolean").
++			allowed_qty = table.produced_qty
++			if not allow_delivery_of_overproduced_qty:
++				allowed_qty = Case().when(table.produced_qty < table.qty, table.produced_qty).else_(table.qty)
++
+ 			query = (
+ 				frappe.qb.from_(table)
+-				.select(
+-					(
+-						Case()
+-						.when(
+-							(table.produced_qty < table.qty)
+-							| ValueWrapper(allow_delivery_of_overproduced_qty),
+-							table.produced_qty,
+-						)
+-						.else_(table.qty)
+-						- table.delivered_qty
+-					).as_("max_allowed_qty")
+-				)
++				.select((allowed_qty - table.delivered_qty).as_("max_allowed_qty"))
+ 				.where((table.name == item.scio_detail) & (table.docstatus == 1))
+ 			)
+ 			max_allowed_qty = query.run(pluck="max_allowed_qty")

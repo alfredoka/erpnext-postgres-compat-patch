@@ -1,0 +1,54 @@
+diff --git a/erpnext/utilities/activation.py b/erpnext/utilities/activation.py
+index e0e3990..4399a5e 100644
+--- a/erpnext/utilities/activation.py
++++ b/erpnext/utilities/activation.py
+@@ -54,8 +54,11 @@ def get_level(site_info):
+ 		activation_level += 1
+ 	sales_data.append({"Communication": communication_number})
+ 
+-	# recent login
+-	if frappe.db.sql("select name from tabUser where last_login > date_sub(now(), interval 2 day) limit 1"):
++	# recent login; the cutoff is computed here: date_sub() is MariaDB-only
++	if frappe.db.sql(
++		"select name from tabUser where last_login > %s limit 1",
++		frappe.utils.add_to_date(frappe.utils.now_datetime(), days=-2),
++	):
+ 		activation_level += 1
+ 
+ 	level = {"activation_level": activation_level, "sales_data": sales_data}
+diff --git a/erpnext/utilities/product.py b/erpnext/utilities/product.py
+index 8fe71e3..c803b08 100644
+--- a/erpnext/utilities/product.py
++++ b/erpnext/utilities/product.py
+@@ -2,7 +2,7 @@
+ # License: GNU General Public License v3. See license.txt
+ 
+ import frappe
+-from frappe.utils import cint, flt, fmt_money
++from frappe.utils import cint, cstr, flt, fmt_money
+ 
+ from erpnext.accounts.doctype.pricing_rule.pricing_rule import get_pricing_rule_for_item
+ 
+@@ -131,7 +131,9 @@ def get_item_codes_by_attributes(attribute_filters, template_item_code=None):
+ 		query_values = []
+ 		for attribute_value in attribute_values:
+ 			wheres.append("( attribute = %s and attribute_value = %s )")
+-			query_values += [attribute, attribute_value]
++			# attribute_value is a varchar column; cast values to str so postgres doesn't choke on
++			# `varchar = numeric` for numeric attributes (stored values are strings on both backends)
++			query_values += [attribute, cstr(attribute_value)]
+ 
+ 		attribute_query = " or ".join(wheres)
+ 
+@@ -162,9 +164,9 @@ def get_item_codes_by_attributes(attribute_filters, template_item_code=None):
+ 				)
+ 			GROUP BY
+ 				t1.parent
+-			ORDER BY
+-				NULL
+ 		"""
++		# no MariaDB `ORDER BY NULL` (it only skipped the implicit sort of GROUP BY): postgres rejects a
++		# non-integer constant in ORDER BY, and the rows go into a set anyway
+ 
+ 		item_codes = set([r[0] for r in frappe.db.sql(query, query_values)])
+ 		items.append(item_codes)

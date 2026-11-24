@@ -1,0 +1,16 @@
+diff --git a/erpnext/support/report/support_hour_distribution/support_hour_distribution.py b/erpnext/support/report/support_hour_distribution/support_hour_distribution.py
+index 823efb0..5d03cf6 100644
+--- a/erpnext/support/report/support_hour_distribution/support_hour_distribution.py
++++ b/erpnext/support/report/support_hour_distribution/support_hour_distribution.py
+@@ -59,7 +59,10 @@ def get_hours_count(start_time, end_time, company=None):
+ 	if company:
+ 		filters.append(["company", "=", company])
+ 
+-	return frappe.get_list("Issue", filters=filters, fields=[{"COUNT": "*", "as": "count"}])[0].count
++	# order_by=None: the default ORDER BY creation next to an aggregate is a GroupingError on postgres
++	return frappe.get_list(
++		"Issue", filters=filters, fields=[{"COUNT": "*", "as": "count"}], order_by=None
++	)[0].count
+ 
+ 
+ def get_columns():
